@@ -169,6 +169,34 @@ happen before an event is fully handled.
 
 ---
 
+## Which bot sends the notifications?
+
+The service polls and posts to the **"Samsara Notifications"** group using the
+Samsara notification bot (**@wenzesambot**). Set that bot's token in
+**`SAMSARA_BOT_TOKEN`** (preferred). If unset, the service falls back to the
+legacy `TELEGRAM_BOT_TOKEN`.
+
+That bot **must be a member** of the notifications group (`HARDCODED_GROUP_ID`,
+default `-5192934125`). If the token belongs to a different bot that isn't in the
+group, every send fails with `400 Bad Request: chat not found` — and because the
+error is permanent, the notifications target is skipped (the driver group is
+still delivered, with no duplicates). Using the wrong bot token also causes
+`409 Conflict … terminated by other getUpdates` if that bot is being polled by
+another service.
+
+On startup the service logs which bot it authenticated as and whether that bot
+can reach the notifications group:
+
+```
+[Samsara] Notification bot is @wenzesambot (id …), token from SAMSARA_BOT_TOKEN.
+[Samsara] ✓ @wenzesambot can access notifications group "Samsara Notifications" (-5192934125).
+```
+
+A `✗ … CANNOT access …` line means the wrong token is configured or the bot
+isn't in the group.
+
+---
+
 ## Keeping the free Render instance awake
 
 Render's free web services spin down after inactivity. The service exposes a
