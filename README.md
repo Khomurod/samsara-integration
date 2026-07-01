@@ -131,6 +131,62 @@ next poll simply runs on the next tick without crashing or retrying in a tight l
 
 ---
 
+## Idempotent delivery (never send a duplicate)
+
+Every alert is delivered independently to each **target** — each notification
+subscriber, the hardcoded "Samsara Notifications" group, and the matched driver
+group. Delivery is tracked per target in a durable Postgres ledger so retries,
+restarts, and redeploys can never re-send a message a target already received.
+
+**Table `samsara_event_deliveries`** (created automatically in `db.initPgDb()`):
+
+| Column           | Meaning                                                        |
+|------------------|----------------------------------------------------------------|
+| `event_id`       | Samsara event id (part of the primary key)                     |
+| `target_chat_id` | Telegram chat/group id (part of the primary key)               |
+| `status`         | `delivered` (target already got it) or `permanent` (skip it)   |
+| `updated_at`     | Last update time                                               |
+
+Primary key is `(event_id, target_chat_id)`.
+
+How the guarantee works:
+
+- **Before** sending to a target, its ledger row is checked. `delivered` and
+  `permanent` targets are skipped.
+- **After** a successful send, the target is recorded `delivered`.
+- Telegram errors are classified: **permanent** (400 chat-not-found / bad
+  request, 403 blocked/kicked/not-a-member) are recorded and skipped forever;
+  **transient** (429, 5xx, network/timeout) are left un-recorded so they retry.
+- The delivery is only re-queued (the queue re-runs the event on the next poll)
+  when a **transient** failure remains on a not-yet-succeeded target. A permanent
+  failure on the notifications group therefore never causes the already-delivered
+  driver group to be re-sent — this is what fixed the production duplicate bug.
+
+This ledger works alongside the existing `samsara_processed_events` dedup table:
+`samsara_processed_events` records "event fully handled, stop polling it", while
+`samsara_event_deliveries` prevents duplicates across the per-target retries that
+happen before an event is fully handled.
+
+---
+
+## Keeping the free Render instance awake
+
+Render's free web services spin down after inactivity. The service exposes a
+lightweight, auth-free health endpoint that responds quickly with a small JSON
+body:
+
+```
+GET https://samsara-integration.onrender.com/health   → 200 {"status":"ok",...}
+GET https://samsara-integration.onrender.com/          → 200 {"service":"samsara-integration","status":"ok"}
+```
+
+Set up a free uptime ping (e.g. [cron-job.org](https://cron-job.org)) to `GET`
+**https://samsara-integration.onrender.com/health** every ~10 minutes to keep the
+instance from sleeping. Neither endpoint requires authentication or touches the
+database, so pings stay fast and cheap.
+
+---
+
 ## Testing
 
 | Script              | What it does                                                     |

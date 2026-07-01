@@ -12,14 +12,20 @@ const TelegramBot = require('node-telegram-bot-api');
 
 const coordinator = require('./src/pollCoordinator');
 const store = require('./src/store');
+const samsaraDb = require('./src/db');
 const { determineTargetGroup } = require('./src/routing');
 const { resolveDriverCaption } = require('./src/driverAlertMessageAi');
 const { sendDriverGroupAlert } = require('./src/driverGroupDelivery');
 const {
     isDriverMembershipAccessError,
     appendDriverMissingNote,
-    shouldRetryDelivery,
 } = require('./src/deliveryWarnings');
+const { deliverEvent } = require('./src/broadcastDelivery');
+const { createDeliveryTracker, classifyTelegramError } = require('./src/deliveryTracker');
+
+// Durable per-(event, target) delivery ledger — the source of truth for
+// "already sent, do not send again".
+const deliveryTracker = createDeliveryTracker(samsaraDb);
 
 const TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -57,6 +63,11 @@ app.get('/health', (req, res) => {
         uptime: process.uptime(),
         timestamp: new Date().toISOString(),
     });
+});
+
+// Plain root — some uptime pingers hit "/". Keep it tiny, auth-free, and 200.
+app.get('/', (req, res) => {
+    res.json({ service: 'samsara-integration', status: 'ok' });
 });
 
 // ?? Broadcast helper ??????????????????????????????????????????????????????????
@@ -129,7 +140,12 @@ async function downloadVideo(videoUrl) {
     return buffer;
 }
 
-// Ensure the queue in poller.js knows how to send messages
+// Ensure the queue in poller.js knows how to send messages.
+//
+// Delegates the actual per-target, idempotent delivery to deliverEvent() in
+// src/broadcastDelivery.js. This function just wires the real collaborators
+// (bots, store, video downloader, delivery ledger) and manages the per-call
+// video download cache.
 async function broadcast(alertData) {
     const videoCache = new Map();
     const getVideoBuffer = async (url) => {
@@ -144,197 +160,28 @@ async function broadcast(alertData) {
         return videoCache.get(url);
     };
 
-    const subscribers = await store.getAll();
-    
-    // Always include the hardcoded group ID for "Samsara Notifications"
     const forcedId = process.env.HARDCODED_GROUP_ID || "-5192934125";
-    if (!subscribers.map(String).includes(String(forcedId))) {
-        subscribers.push(String(forcedId));
-    }
-
-    const text = typeof alertData === 'string' ? alertData : alertData.text;
-    const videoUrl = typeof alertData === 'string' ? null : alertData.videoUrl;
-    const inwardVideoUrl = typeof alertData === 'string' ? null : alertData.inwardVideoUrl;
-    const eventId = typeof alertData === 'string' ? null : alertData.samsaraEventId;
-    const alertObj = typeof alertData === 'string' ? {} : alertData;
-
-    let notificationsStatus = 'skip';
-    let driverStatus = 'skip';
-    const sentNotificationMessages = [];
-
-    // 1) Send notification first with @wenzesambot.
-    if (subscribers.length === 0) {
-        console.warn('[Bot] No subscribers to broadcast to.');
-        notificationsStatus = 'skip';
-    } else {
-        console.log(`[Bot] Broadcasting to ${subscribers.length} subscriber(s)...`);
-        let notificationsOk = 0;
-        let notificationsFail = 0;
-        let forcedDelivered = false;
-
-        for (const chatId of subscribers) {
-            try {
-                if (videoUrl && inwardVideoUrl) {
-                    console.log(`[Bot] Dual camera detected, sending media group to ${chatId}`);
-                    try {
-                        const [forwardBuf, inwardBuf] = await Promise.all([
-                            getVideoBuffer(videoUrl),
-                            getVideoBuffer(inwardVideoUrl),
-                        ]);
-                        const mediaMessages = await bot.sendMediaGroup(chatId, [
-                            { type: 'video', media: 'attach://forward', caption: text, parse_mode: 'HTML' },
-                            { type: 'video', media: 'attach://inward' },
-                        ], {}, {
-                            forward: { value: forwardBuf, options: { filename: 'forward.mp4', contentType: 'video/mp4' } },
-                            inward: { value: inwardBuf, options: { filename: 'inward.mp4', contentType: 'video/mp4' } },
-                        });
-                        if (Array.isArray(mediaMessages) && mediaMessages[0]?.message_id) {
-                            sentNotificationMessages.push({
-                                chatId,
-                                messageId: mediaMessages[0].message_id,
-                                type: 'caption',
-                            });
-                        }
-                        console.log(`[Bot] Successfully sent dual-camera media group to ${chatId}`);
-                        notificationsOk += 1;
-                        if (String(chatId) === String(forcedId)) forcedDelivered = true;
-                        continue;
-                    } catch (dualErr) {
-                        console.error('[Bot] Dual camera send failed, trying single video fallback:', dualErr.message);
-                    }
-                }
-
-                if (videoUrl) {
-                    console.log(`[Bot] Fetching single video for ${chatId} from: ${videoUrl}`);
-                    try {
-                        const buffer = await getVideoBuffer(videoUrl);
-                        const sentVideo = await bot.sendVideo(chatId, buffer, {
-                            caption: text,
-                            parse_mode: 'HTML',
-                        }, {
-                            filename: 'event.mp4',
-                            contentType: 'video/mp4',
-                        });
-                        if (sentVideo?.message_id) {
-                            sentNotificationMessages.push({
-                                chatId,
-                                messageId: sentVideo.message_id,
-                                type: 'caption',
-                            });
-                        }
-                        console.log(`[Bot] Successfully sent video to ${chatId}`);
-                        notificationsOk += 1;
-                        if (String(chatId) === String(forcedId)) forcedDelivered = true;
-                        continue;
-                    } catch (videoErr) {
-                        console.error('[Bot] Video send failed, falling back to text:', videoErr.message);
-                    }
-                }
-
-                const sentMessage = await bot.sendMessage(chatId, text, {
-                    parse_mode: 'HTML',
-                    disable_web_page_preview: true,
-                });
-                if (sentMessage?.message_id) {
-                    sentNotificationMessages.push({
-                        chatId,
-                        messageId: sentMessage.message_id,
-                        type: 'text',
-                    });
-                }
-                console.log(`[Bot] Successfully sent text alert to ${chatId}`);
-                notificationsOk += 1;
-                if (String(chatId) === String(forcedId)) forcedDelivered = true;
-            } catch (err) {
-                notificationsFail += 1;
-                console.error(`[Bot] Failed to send to ${chatId}:`, err.message);
-                if (err.response?.body?.error_code === 403) {
-                    console.log(`[Bot] Removing blocked user ${chatId}`);
-                    store.remove(chatId);
-                }
-            }
-        }
-
-        notificationsStatus = forcedDelivered ? 'ok' : (notificationsFail > 0 || notificationsOk > 0 ? 'fail' : 'skip');
-    }
-
-    // 2) Then try forwarding to driver group with @wenzefeedback_bot.
     const MANAGEMENT_GROUP_ID = process.env.MANAGEMENT_GROUP_ID || process.env.EMPLOYEE_GROUP_ID;
-    const target = await determineTargetGroup(
-        alertObj,
-        store.findGroupByUnit.bind(store),
-        MANAGEMENT_GROUP_ID,
-    );
-    const targetDriverGroupId = target.targetGroupId;
-    const unitLabel = target.unitNumber || 'unknown';
 
-    if (target.matchReason.startsWith('fallback')) {
-        console.warn(`[Bot] Unmapped vehicle ${target.vehicleId || 'unknown'} unit ${unitLabel} - no driver group mapped, skipping driver forward`);
-    } else {
-        console.log(`[Bot] Routed vehicle ${target.vehicleId || 'unknown'} unit ${target.unitNumber} to ${target.groupName || targetDriverGroupId} (${targetDriverGroupId}) via ${target.matchReason}`);
-    }
-
-    let driverCaption = text;
-    if (targetDriverGroupId && driverBot && !target.matchReason.startsWith('fallback')) {
-        try {
-            driverCaption = await resolveDriverCaption(alertObj, text);
-        } catch (aiErr) {
-            console.error('[Bot] Driver caption AI failed, using standard text:', aiErr.message);
-            driverCaption = text;
-        }
-    }
-
-    let driverMembershipAccessError = false;
-    if (targetDriverGroupId && driverBot) {
-        console.log(`[Bot] Forwarding alert for Unit #${unitLabel} to group ${targetDriverGroupId}...`);
-        driverStatus = 'fail';
-        try {
-            await sendDriverGroupAlert(driverBot, targetDriverGroupId, {
-                caption: driverCaption,
-                videoUrl,
-                inwardVideoUrl,
-                getVideoBuffer,
-            });
-            driverStatus = 'ok';
-            console.log(`[Bot] Successfully forwarded to Driver Group ${targetDriverGroupId}`);
-        } catch (err) {
-            driverMembershipAccessError = isDriverMembershipAccessError(err);
-            console.error(`[Bot] Forwarding failed to ${targetDriverGroupId}:`, err.message);
-        }
-    }
-
-    if (driverMembershipAccessError && notificationsStatus === 'ok') {
-        const notedText = appendDriverMissingNote(text);
-        for (const sent of sentNotificationMessages) {
-            try {
-                if (sent.type === 'text') {
-                    await bot.editMessageText(notedText, {
-                        chat_id: sent.chatId,
-                        message_id: sent.messageId,
-                        parse_mode: 'HTML',
-                        disable_web_page_preview: true,
-                    });
-                } else {
-                    await bot.editMessageCaption(notedText, {
-                        chat_id: sent.chatId,
-                        message_id: sent.messageId,
-                        parse_mode: 'HTML',
-                    });
-                }
-            } catch (noteErr) {
-                console.error(`[Bot] Failed to append driver warning note for ${sent.chatId}:`, noteErr.message);
-            }
-        }
-    }
-
-    console.log(
-        `[Bot] Broadcast complete event=${eventId || 'unknown'} notifications=${notificationsStatus} driver=${driverStatus} unit=${unitLabel}`,
-    );
-
-    videoCache.clear();
-
-    if (shouldRetryDelivery(notificationsStatus)) {
-        throw new Error(`Notification delivery failed for event ${eventId || 'unknown'}`);
+    try {
+        await deliverEvent(alertData, {
+            bot,
+            driverBot,
+            store,
+            determineTargetGroup,
+            resolveDriverCaption,
+            sendDriverGroupAlert,
+            isDriverMembershipAccessError,
+            appendDriverMissingNote,
+            tracker: deliveryTracker,
+            classifyTelegramError,
+            forcedId,
+            managementGroupId: MANAGEMENT_GROUP_ID,
+            getVideoBuffer,
+            log: console,
+        });
+    } finally {
+        videoCache.clear();
     }
 }
 
@@ -416,7 +263,6 @@ bot.onText(/\/help/, (msg) => {
 // ?? Start Server ??????????????????????????????????????????????????????????????
 async function start() {
     await store.init();
-    const samsaraDb = require('./src/db');
     await samsaraDb.initPgDb();
     await new Promise((resolve) => {
         httpServer = app.listen(PORT, resolve);
