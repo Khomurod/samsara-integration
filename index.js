@@ -27,7 +27,14 @@ const { createDeliveryTracker, classifyTelegramError } = require('./src/delivery
 // "already sent, do not send again".
 const deliveryTracker = createDeliveryTracker(samsaraDb);
 
-const TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
+// The Samsara notification bot's OWN token (e.g. @wenzesambot). Prefer the
+// explicit SAMSARA_BOT_TOKEN when set — this bot is what must be a member of
+// the "Samsara Notifications" group. Fall back to TELEGRAM_BOT_TOKEN for
+// backward compatibility with older deployments.
+const SAMSARA_BOT_TOKEN = String(process.env.SAMSARA_BOT_TOKEN || '').trim();
+const LEGACY_TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
+const TOKEN = SAMSARA_BOT_TOKEN || LEGACY_TELEGRAM_BOT_TOKEN;
+const TOKEN_SOURCE = SAMSARA_BOT_TOKEN ? 'SAMSARA_BOT_TOKEN' : 'TELEGRAM_BOT_TOKEN';
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const MAX_VIDEO_BYTES = parseInt(process.env.SAMSARA_MAX_VIDEO_BYTES || '0', 10);
 const USE_WEBHOOK = process.env.USE_WEBHOOK === 'true'; // For Telegram itself, if hosted
@@ -35,9 +42,10 @@ const PUBLIC_URL = (process.env.PUBLIC_WEBHOOK_URL || '').replace(/\/$/, '');
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || PUBLIC_URL;
 
 if (!TOKEN) {
-    console.error('[Samsara] FATAL: TELEGRAM_BOT_TOKEN is required.');
+    console.error('[Samsara] FATAL: SAMSARA_BOT_TOKEN (or legacy TELEGRAM_BOT_TOKEN) is required.');
     process.exit(78); // EX_CONFIG
 }
+console.log(`[Samsara] Notification bot token loaded from ${TOKEN_SOURCE}.`);
 
 // Prevent a nightmare dual-polling configuration: if this process were
 // started with the same BOT_TOKEN as the main Telegraf bot, both would
@@ -46,7 +54,7 @@ if (!TOKEN) {
 const resolvedMainBotToken = String(process.env.BOT_TOKEN || '').trim();
 if (resolvedMainBotToken && resolvedMainBotToken === TOKEN) {
     console.error(
-        '[Samsara] FATAL: Samsara TELEGRAM_BOT_TOKEN equals the main feedback BOT_TOKEN. '
+        '[Samsara] FATAL: Samsara notification bot token equals the main feedback BOT_TOKEN. '
         + 'This would cause getUpdates() polling conflicts. Use distinct bots.',
     );
     process.exit(78); // EX_CONFIG — permanent configuration error, do not restart
@@ -306,8 +314,34 @@ async function start() {
     console.log('?? Bot is ready! Send /start to @wenzesambot on Telegram');
     console.log('');
 
+    // Best-effort self-check: confirm WHICH bot we are and whether it can
+    // actually reach the hardcoded "Samsara Notifications" group. This makes a
+    // wrong-token / not-a-member misconfiguration obvious in the logs instead
+    // of showing up only as repeated "chat not found" during delivery.
+    await verifyNotificationBotAccess();
+
     // Start coordinated polling
     coordinator.start();
+}
+
+async function verifyNotificationBotAccess() {
+    try {
+        const me = await bot.getMe();
+        console.log(`[Samsara] Notification bot is @${me.username} (id ${me.id}), token from ${TOKEN_SOURCE}.`);
+        const forcedId = process.env.HARDCODED_GROUP_ID || '-5192934125';
+        try {
+            const chat = await bot.getChat(forcedId);
+            console.log(`[Samsara] ✓ @${me.username} can access notifications group "${chat.title || forcedId}" (${forcedId}).`);
+        } catch (chatErr) {
+            console.error(
+                `[Samsara] ✗ @${me.username} CANNOT access notifications group ${forcedId}: ${chatErr.message}. `
+                + 'Add this bot to that group, or point SAMSARA_BOT_TOKEN at the bot that IS a member. '
+                + 'Delivery to the notifications group will be skipped as a permanent failure until fixed.',
+            );
+        }
+    } catch (err) {
+        console.warn('[Samsara] Startup bot self-check skipped:', err.message);
+    }
 }
 
 start().catch((err) => {
