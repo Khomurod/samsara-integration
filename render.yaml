@@ -1,0 +1,67 @@
+# Render Blueprint for the standalone Samsara → Telegram poller.
+#
+# This file assumes the contents of the `samsara-integration/` folder have been
+# copied to the ROOT of their own GitHub repository (so index.js, src/, and
+# package.json sit at the repo root). Deploy it as its own Render web service.
+#
+# It cooperates with the main "driver-feedback-bot" hub ONLY through:
+#   1. The SHARED PostgreSQL database (DATABASE_URL) — it reads the `groups`
+#      table to know which driver Telegram group maps to each truck unit number.
+#   2. The SHARED Telegram bot tokens — BOT_TOKEN posts driver-group videos as
+#      the main feedback bot; TELEGRAM_BOT_TOKEN sends the Samsara notification
+#      group / subscribers as the Samsara bot.
+# Use the SAME values here as the main hub for DATABASE_URL and BOT_TOKEN.
+services:
+  - type: web
+    name: samsara-poller
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    healthCheckPath: /health
+    envVars:
+      # --- Telegram bots ---
+      # The SAMSARA notification bot's own token (e.g. @wenzesambot).
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      # The MAIN feedback bot token (e.g. @wenzefeedback_bot) — used send-only
+      # to forward the video + friendly caption into the matched driver group.
+      # MUST be the same value the main hub uses for BOT_TOKEN.
+      - key: BOT_TOKEN
+        sync: false
+
+      # --- Samsara API ---
+      - key: SAMSARA_API_KEY
+        sync: false
+      - key: SAMSARA_API_BASE
+        value: https://api.samsara.com
+
+      # --- Shared database (MUST equal the main hub's DATABASE_URL) ---
+      - key: DATABASE_URL
+        sync: false
+
+      # --- Group routing ---
+      - key: MANAGEMENT_GROUP_ID
+        sync: false
+      - key: EMPLOYEE_GROUP_ID
+        sync: false
+      # Optional: the fixed "Samsara Notifications" group id. If omitted the
+      # code falls back to its built-in default.
+      - key: HARDCODED_GROUP_ID
+        sync: false
+
+      # --- AI for the friendly driver-group caption (the "joke" message) ---
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+
+      # --- Optional: persistent subscriber storage (survives redeploys) ---
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+
+      # This service has the whole instance to itself now, so it can use more heap.
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=400

@@ -1,0 +1,8 @@
+node_modules/
+data/
+*.log
+
+# Never commit real secrets to the new repository.
+.env
+.env.*
+!.env.example
