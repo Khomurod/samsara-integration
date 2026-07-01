@@ -269,10 +269,67 @@ module.exports = {
                     value TEXT,
                     updated_at TIMESTAMP DEFAULT NOW()
                 )`);
-                console.log('[DB] PostgreSQL deduplication table ready.');
+                // Per-(event, target) delivery ledger. This is what makes
+                // delivery idempotent: before sending an event to any target
+                // we consult this table, and after a successful send we record
+                // it here so retries/restarts/redeploys never re-send.
+                //   status = 'delivered'  → target already got the message
+                //   status = 'permanent'  → target can never receive it (e.g.
+                //                            chat not found / bot blocked); skip
+                await pgPool.query(`CREATE TABLE IF NOT EXISTS samsara_event_deliveries (
+                    event_id VARCHAR(255) NOT NULL,
+                    target_chat_id VARCHAR(255) NOT NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'delivered',
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    PRIMARY KEY (event_id, target_chat_id)
+                )`);
+                console.log('[DB] PostgreSQL deduplication + delivery-ledger tables ready.');
             } catch (err) {
                 console.error('[DB] Failed to init pg table:', err.message);
             }
+        }
+    },
+
+    /**
+     * Return the recorded per-target delivery rows for an event.
+     * @param {string} eventId
+     * @returns {Promise<Array<{target_chat_id: string, status: string}>>}
+     */
+    async getEventDeliveries(eventId) {
+        if (!pgPool || !eventId) return [];
+        try {
+            const res = await pgPool.query(
+                'SELECT target_chat_id, status FROM samsara_event_deliveries WHERE event_id = $1',
+                [String(eventId)],
+            );
+            return res.rows || [];
+        } catch (err) {
+            console.error('[DB] getEventDeliveries error:', err.message);
+            return [];
+        }
+    },
+
+    /**
+     * Record the outcome of delivering an event to a single target.
+     * A 'delivered' record is never downgraded to 'permanent' (a target that
+     * already received the message stays recorded as delivered).
+     * @param {string} eventId
+     * @param {string} targetChatId
+     * @param {'delivered'|'permanent'} status
+     */
+    async recordEventDelivery(eventId, targetChatId, status) {
+        if (!pgPool || !eventId || targetChatId == null) return;
+        try {
+            await pgPool.query(
+                `INSERT INTO samsara_event_deliveries (event_id, target_chat_id, status, updated_at)
+                 VALUES ($1, $2, $3, NOW())
+                 ON CONFLICT (event_id, target_chat_id)
+                 DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
+                 WHERE samsara_event_deliveries.status <> 'delivered'`,
+                [String(eventId), String(targetChatId), String(status)],
+            );
+        } catch (err) {
+            console.error('[DB] recordEventDelivery error:', err.message);
         }
     },
 
