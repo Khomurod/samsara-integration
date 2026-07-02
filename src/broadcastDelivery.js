@@ -150,7 +150,7 @@ async function deliverEvent(alertData, deps) {
       try {
         const sent = await sendNotificationToTarget(bot, chatId, alert, log);
         if (sent?.messageId) {
-          sentNotificationMessages.push({ chatId, messageId: sent.messageId, type: sent.type });
+          sentNotificationMessages.push({ botKind: 'notification', chatId, messageId: sent.messageId, type: sent.type });
         }
         await markSuccess(chatId);
         notificationsOk += 1;
@@ -185,6 +185,7 @@ async function deliverEvent(alertData, deps) {
 
   let driverStatus = 'skip';
   let driverMembershipAccessError = false;
+  let driverSentMessage = null;
 
   if (isFallback) {
     log.warn?.(`[Bot] Unmapped vehicle ${target.vehicleId || 'unknown'} unit ${unitLabel} - no driver group mapped, skipping driver forward`);
@@ -202,12 +203,20 @@ async function deliverEvent(alertData, deps) {
       }
 
       try {
-        await sendDriverGroupAlert(driverBot, targetDriverGroupId, {
+        const driverSent = await sendDriverGroupAlert(driverBot, targetDriverGroupId, {
           caption: driverCaption,
           videoUrl,
           inwardVideoUrl,
           getVideoBuffer,
         });
+        if (driverSent?.messageId) {
+          driverSentMessage = {
+            botKind: 'driver',
+            chatId: targetDriverGroupId,
+            messageId: driverSent.messageId,
+            type: driverSent.type,
+          };
+        }
         await markSuccess(targetDriverGroupId);
         driverStatus = 'ok';
         log.log?.(`[Bot] Successfully forwarded to Driver Group ${targetDriverGroupId}`);
@@ -266,6 +275,12 @@ async function deliverEvent(alertData, deps) {
     throw new Error(`Transient delivery failure for event ${eventId || 'unknown'}; will retry pending targets`);
   }
 
+  // Message references the caller can reply to later to attach the dashcam
+  // video (backfill) once it becomes available. Only messages we actually sent
+  // THIS run are included; already-delivered/skipped targets are omitted.
+  const sentMessages = [...sentNotificationMessages];
+  if (driverSentMessage) sentMessages.push(driverSentMessage);
+
   return {
     eventId,
     notificationsOk,
@@ -274,6 +289,9 @@ async function deliverEvent(alertData, deps) {
     notificationsPermanentFail,
     driverStatus,
     transientPending,
+    // True when the alert already carried video at send time (no backfill needed).
+    hadVideoAtSend: Boolean(videoUrl || inwardVideoUrl),
+    sentMessages,
   };
 }
 

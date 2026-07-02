@@ -107,6 +107,60 @@ async function fetchSafetyEventDetailFromApi(eventId, apiKey, baseUrl) {
 }
 
 /**
+ * Refetch a safety event via the /fleet/safety-events time-window endpoint and
+ * return the matching row. Harsh-event ids from /fleet/safety-events (e.g.
+ * "281475003766008-1783011831230") are NOT UUIDs, so the /safety-events
+ * ?safetyEventIds= lookup rejects them with HTTP 400 — the time-window query is
+ * the reliable way to re-read an event once its `downloadForwardVideoUrl`
+ * finishes uploading.
+ */
+async function fetchSafetyEventViaFleetWindow(eventId, rawEvent, apiKey, baseUrl) {
+  if (!eventId || !apiKey) return null;
+
+  const base = (baseUrl || 'https://api.samsara.com').replace(/\/$/, '');
+  const anchorMs = Date.parse(
+    rawEvent?.time || rawEvent?.happenedAtTime || rawEvent?.createdAtTime || '',
+  );
+  const centerMs = Number.isFinite(anchorMs) ? anchorMs : Date.now();
+  const startTime = new Date(centerMs - 5 * 60 * 1000).toISOString();
+  const endTime = new Date(centerMs + 5 * 60 * 1000).toISOString();
+
+  const params = new URLSearchParams({
+    startTime,
+    endTime,
+    limit: '100',
+    includeDriver: 'true',
+  });
+  const url = `${base}/fleet/safety-events?${params.toString()}`;
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: 'application/json',
+    },
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`${res.status}: ${body.slice(0, 200)}`);
+  }
+
+  const json = await res.json();
+  const rows = json.data || [];
+  return rows.find((r) => String(r.id) === String(eventId)) || null;
+}
+
+/**
+ * Re-read an event's video URLs after a delay via the fleet time-window
+ * endpoint (the cheap path — no camera retrieval job needed once the clip has
+ * uploaded and `downloadForwardVideoUrl` is populated).
+ */
+async function refetchVideoUrlsViaFleetWindow(eventId, rawEvent, apiKey, baseUrl) {
+  const row = await fetchSafetyEventViaFleetWindow(eventId, rawEvent, apiKey, baseUrl);
+  if (!row) return { forwardUrl: null, inwardUrl: null };
+  return extractVideoUrlsFromSafetyEvent(row);
+}
+
+/**
  * Refetch by id when the list/time-window response omitted `media` URLs
  * (common for harsh events until clips finish uploading).
  */
@@ -137,6 +191,8 @@ async function enrichSafetyEventWithMediaIfNeeded(event, apiKey, baseUrl) {
 module.exports = {
   extractVideoUrlsFromSafetyEvent,
   fetchSafetyEventDetailFromApi,
+  fetchSafetyEventViaFleetWindow,
+  refetchVideoUrlsViaFleetWindow,
   enrichSafetyEventWithMediaIfNeeded,
   mergeSafetyEventDetail,
 };

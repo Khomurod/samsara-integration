@@ -22,6 +22,7 @@ const {
 } = require('./src/deliveryWarnings');
 const { deliverEvent } = require('./src/broadcastDelivery');
 const { createDeliveryTracker, classifyTelegramError } = require('./src/deliveryTracker');
+const { scheduleVideoBackfill } = require('./src/videoBackfill');
 
 // Durable per-(event, target) delivery ledger — the source of truth for
 // "already sent, do not send again".
@@ -171,8 +172,9 @@ async function broadcast(alertData) {
     const forcedId = process.env.HARDCODED_GROUP_ID || "-5192934125";
     const MANAGEMENT_GROUP_ID = process.env.MANAGEMENT_GROUP_ID || process.env.EMPLOYEE_GROUP_ID;
 
+    let result;
     try {
-        await deliverEvent(alertData, {
+        result = await deliverEvent(alertData, {
             bot,
             driverBot,
             store,
@@ -190,6 +192,41 @@ async function broadcast(alertData) {
         });
     } finally {
         videoCache.clear();
+    }
+
+    // The alert was sent immediately. If it went out without video, schedule a
+    // backfill: resolve/generate the dashcam video shortly after and post it as
+    // a reply under each original alert (notifications group + subscribers +
+    // driver group). deliverEvent throws on transient failure, so we only reach
+    // here after a clean delivery run.
+    const backfill = alertData && typeof alertData === 'object' ? alertData.videoBackfill : null;
+    if (backfill && result && !result.hadVideoAtSend && result.sentMessages?.length) {
+        scheduleVideoBackfill({
+            eventId: backfill.eventId,
+            rawEvent: backfill.rawEvent,
+            sentMessages: result.sentMessages,
+            apiKey: process.env.SAMSARA_API_KEY,
+            baseUrl: process.env.SAMSARA_API_BASE || 'https://api.samsara.com',
+            resolveBot: (kind) => (kind === 'driver' ? driverBot : bot),
+            // Each backfill uses its own short-lived download cache; the video
+            // URLs are freshly resolved (pre-signed, time-limited) at backfill time.
+            makeGetVideoBuffer: () => {
+                const cache = new Map();
+                return async (url) => {
+                    if (!url) return null;
+                    if (!cache.has(url)) {
+                        cache.set(url, downloadVideo(url).catch((err) => {
+                            cache.delete(url);
+                            throw err;
+                        }));
+                    }
+                    return cache.get(url);
+                };
+            },
+            refetchFn: backfill.refetchFn || undefined,
+            retrievalFn: backfill.retrievalFn || undefined,
+            delayMs: backfill.delayMs,
+        });
     }
 }
 
