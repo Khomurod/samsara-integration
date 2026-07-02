@@ -29,6 +29,41 @@ event that occurred even if it was offline or restarting.
 
 ---
 
+## Immediate delivery + video backfill
+
+Harsh braking / acceleration / turn events almost always fire **before** their
+dashcam clip has finished uploading, so the video is not yet available on the
+first poll. Instead of holding the whole notification back waiting for video,
+the service now:
+
+1. **Sends the alert immediately** — text-only when there is no clip yet. Fast
+   alerts are the priority; a missing video never delays the notification.
+2. **Comes back a short while later** (`SAMSARA_VIDEO_RETRY_DELAY_MS`, default
+   60s) and **re-reads the event** through the same `/fleet/safety-events`
+   time-window endpoint. Once the clip has uploaded, `downloadForwardVideoUrl`
+   is populated and this cheap path finds it — no camera job needed.
+3. **If it is still missing, it generates the video itself** by triggering
+   Samsara media retrieval (`POST /cameras/media/retrieval`) and polling
+   `GET /cameras/media` until the clip is produced.
+4. **Attaches the video to the messages already sent** by posting it as a
+   **reply** to the original alert — in the "Samsara Notifications" group, every
+   subscriber, **and** the matched driver group.
+
+> **Why a reply and not an in-place edit?** Telegram cannot turn an existing
+> *text* message into a *video* message (`editMessageMedia` only works on
+> messages that already contain media). Replying to the original alert threads
+> the video directly under it, which is the reliable way to "add the video"
+> after the fact.
+
+Set `SAMSARA_VIDEO_RETRY_ENABLED=false` to disable the backfill entirely
+(text-only alerts, never enriched with video).
+
+Note: the backfill is driven by an in-memory timer, so it is best-effort — if
+the process restarts during the wait window, that one event's video is not
+backfilled (the text alert was already delivered and is never re-sent).
+
+---
+
 ## File Structure
 
 ```

@@ -4,10 +4,8 @@ const assert = require('node:assert/strict');
 const {
   isVideoRetryEnabled,
   getVideoRetryDelayMs,
-  shouldDeferVideoRetry,
   patchAlertVideoUrls,
   enqueueFormattedAlert,
-  scheduleVideoRetryDelivery,
   inferVideoRetrievalParams,
   pollRetrievedVideoUrls,
   DEFAULT_DELAY_MS,
@@ -21,26 +19,6 @@ test.after(() => {
   else process.env.SAMSARA_VIDEO_RETRY_ENABLED = origRetryEnabled;
   if (origRetryDelay === undefined) delete process.env.SAMSARA_VIDEO_RETRY_DELAY_MS;
   else process.env.SAMSARA_VIDEO_RETRY_DELAY_MS = origRetryDelay;
-});
-
-test('shouldDeferVideoRetry is false when videoUrl is set', () => {
-  delete process.env.SAMSARA_VIDEO_RETRY_ENABLED;
-  assert.equal(shouldDeferVideoRetry({ videoUrl: 'https://x.mp4' }, 'evt-1'), false);
-});
-
-test('shouldDeferVideoRetry is false when eventId is missing', () => {
-  delete process.env.SAMSARA_VIDEO_RETRY_ENABLED;
-  assert.equal(shouldDeferVideoRetry({ text: 'alert' }, null), false);
-});
-
-test('shouldDeferVideoRetry is true when no URLs and eventId present', () => {
-  delete process.env.SAMSARA_VIDEO_RETRY_ENABLED;
-  assert.equal(shouldDeferVideoRetry({ text: 'alert' }, 'evt-1'), true);
-});
-
-test('shouldDeferVideoRetry is false when SAMSARA_VIDEO_RETRY_ENABLED=false', () => {
-  process.env.SAMSARA_VIDEO_RETRY_ENABLED = 'false';
-  assert.equal(shouldDeferVideoRetry({ text: 'alert' }, 'evt-1'), false);
 });
 
 test('getVideoRetryDelayMs defaults and clamps', () => {
@@ -63,93 +41,58 @@ test('patchAlertVideoUrls sets forward and inward URLs', () => {
   assert.equal(alert.inwardVideoUrl, 'https://inward.mp4');
 });
 
-test('enqueueFormattedAlert calls queueAlert immediately when video present', () => {
+test('enqueueFormattedAlert queues immediately when video present (no backfill)', () => {
   delete process.env.SAMSARA_VIDEO_RETRY_ENABLED;
   let called = 0;
   const alert = { text: 'x', videoUrl: 'https://v.mp4' };
   enqueueFormattedAlert(alert, { id: 'evt-1' }, () => { called += 1; });
   assert.equal(called, 1);
   assert.equal(alert.samsaraEventId, 'evt-1');
+  assert.equal(alert.videoBackfill, undefined);
 });
 
-test('enqueueFormattedAlert defers queueAlert until timer fires', async () => {
+test('enqueueFormattedAlert queues immediately and attaches backfill when video missing', () => {
   delete process.env.SAMSARA_VIDEO_RETRY_ENABLED;
   let queued = 0;
   const alert = { text: 'x' };
-  let timerFn = null;
-
-  enqueueFormattedAlert(
-    alert,
-    { id: 'evt-defer' },
-    () => { queued += 1; },
-    {
-      delayMs: 0,
-      setTimer: (fn) => {
-        timerFn = fn;
-      },
-      refetchFn: async () => ({
-        forwardUrl: 'https://retry.mp4',
-        inwardUrl: null,
-      }),
-    },
-  );
-
-  assert.equal(queued, 0);
-  assert.equal(timerFn != null, true);
-  await timerFn();
+  const rawEvent = { id: 'evt-nofood' };
+  enqueueFormattedAlert(alert, rawEvent, () => { queued += 1; });
+  // Immediate send — no timer/defer.
   assert.equal(queued, 1);
-  assert.equal(alert.videoUrl, 'https://retry.mp4');
+  assert.equal(alert.samsaraEventId, 'evt-nofood');
+  assert.ok(alert.videoBackfill, 'expected a backfill descriptor');
+  assert.equal(alert.videoBackfill.eventId, 'evt-nofood');
+  assert.equal(alert.videoBackfill.rawEvent, rawEvent);
 });
 
-test('enqueueFormattedAlert starts retrieval when delayed refetch has no video', async () => {
+test('enqueueFormattedAlert carries custom refetch/retrieval fns into backfill descriptor', () => {
+  delete process.env.SAMSARA_VIDEO_RETRY_ENABLED;
+  const alert = { text: 'x' };
+  const refetchFn = async () => ({ forwardUrl: null, inwardUrl: null });
+  const retrievalFn = async () => ({ forwardUrl: 'https://gen.mp4', inwardUrl: null });
+  enqueueFormattedAlert(alert, { id: 'evt-speed' }, () => {}, { refetchFn, retrievalFn, delayMs: 1234 });
+  assert.equal(alert.videoBackfill.refetchFn, refetchFn);
+  assert.equal(alert.videoBackfill.retrievalFn, retrievalFn);
+  assert.equal(alert.videoBackfill.delayMs, 1234);
+});
+
+test('enqueueFormattedAlert attaches no backfill when retry disabled', () => {
+  process.env.SAMSARA_VIDEO_RETRY_ENABLED = 'false';
+  let queued = 0;
+  const alert = { text: 'x' };
+  enqueueFormattedAlert(alert, { id: 'evt-off' }, () => { queued += 1; });
+  assert.equal(queued, 1);
+  assert.equal(alert.videoBackfill, undefined);
+  delete process.env.SAMSARA_VIDEO_RETRY_ENABLED;
+});
+
+test('enqueueFormattedAlert attaches no backfill when eventId missing', () => {
   delete process.env.SAMSARA_VIDEO_RETRY_ENABLED;
   let queued = 0;
   const alert = { text: 'x' };
-  let timerFn = null;
-
-  enqueueFormattedAlert(
-    alert,
-    { id: 'evt-retrieve' },
-    () => { queued += 1; },
-    {
-      delayMs: 0,
-      setTimer: (fn) => {
-        timerFn = fn;
-      },
-      refetchFn: async () => ({
-        forwardUrl: null,
-        inwardUrl: null,
-      }),
-      retrievalFn: async () => ({
-        forwardUrl: 'https://retrieved.mp4',
-        inwardUrl: null,
-      }),
-    },
-  );
-
-  await timerFn();
+  enqueueFormattedAlert(alert, {}, () => { queued += 1; });
   assert.equal(queued, 1);
-  assert.equal(alert.videoUrl, 'https://retrieved.mp4');
-});
-
-test('scheduleVideoRetryDelivery still queues on refetch failure', async () => {
-  delete process.env.SAMSARA_VIDEO_RETRY_ENABLED;
-  let queued = 0;
-  const alert = { text: 'x' };
-  let timerFn = null;
-
-  scheduleVideoRetryDelivery({
-    formattedAlert: alert,
-    eventId: 'evt-fail',
-    queueAlert: () => { queued += 1; },
-    delayMs: 0,
-    setTimer: (fn) => { timerFn = fn; },
-    refetchFn: async () => { throw new Error('API down'); },
-  });
-
-  await timerFn();
-  assert.equal(queued, 1);
-  assert.equal(alert.videoUrl, undefined);
+  assert.equal(alert.videoBackfill, undefined);
 });
 
 test('inferVideoRetrievalParams tolerates invalid start with valid end', () => {

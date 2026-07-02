@@ -2,6 +2,8 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { sendDriverGroupAlert } = require('../src/driverGroupDelivery');
+const { deliverEvent } = require('../src/broadcastDelivery');
+const { classifyTelegramError } = require('../src/deliveryTracker');
 const {
   appendDriverMissingNote,
   isDriverMembershipAccessError,
@@ -123,4 +125,71 @@ test('only notification failure should trigger retry signal', () => {
   assert.equal(shouldRetryDelivery('fail'), true);
   assert.equal(shouldRetryDelivery('ok'), false);
   assert.equal(shouldRetryDelivery('skip'), false);
+});
+
+function buildDeliverDeps(overrides = {}) {
+  const noopTracker = {
+    async getTargetStatuses() { return new Map(); },
+    async recordSuccess() {},
+    async recordPermanentSkip() {},
+  };
+  return {
+    bot: {
+      async sendMessage() { return { message_id: 100 }; },
+      async sendVideo() { return { message_id: 100 }; },
+      async sendMediaGroup() { return [{ message_id: 100 }]; },
+    },
+    driverBot: {
+      async sendMessage() { return { message_id: 200 }; },
+      async sendVideo() { return { message_id: 200 }; },
+      async sendMediaGroup() { return [{ message_id: 200 }]; },
+    },
+    store: {
+      async getAll() { return []; },
+      findGroupByUnit: async () => '-700',
+      async remove() {},
+    },
+    determineTargetGroup: async () => ({
+      targetGroupId: '-700', unitNumber: '27065', matchReason: 'unit', vehicleId: 'veh-1',
+    }),
+    resolveDriverCaption: async (_alert, text) => text,
+    sendDriverGroupAlert,
+    isDriverMembershipAccessError: () => false,
+    appendDriverMissingNote: (t) => t,
+    tracker: noopTracker,
+    classifyTelegramError,
+    forcedId: '-500',
+    managementGroupId: null,
+    getVideoBuffer: async () => Buffer.from('x'),
+    log: { log: () => {}, warn: () => {}, error: () => {} },
+    ...overrides,
+  };
+}
+
+test('deliverEvent reports no video at send and returns sent message refs (text)', async () => {
+  const deps = buildDeliverDeps();
+  const result = await deliverEvent(
+    { text: 'alert', samsaraEventId: 'evt-nb' },
+    deps,
+  );
+
+  assert.equal(result.hadVideoAtSend, false);
+  // notifications group (-500) + driver group (-700) each got a text message.
+  const kinds = result.sentMessages.map((m) => m.botKind).sort();
+  assert.deepEqual(kinds, ['driver', 'notification']);
+  const notif = result.sentMessages.find((m) => m.botKind === 'notification');
+  const driver = result.sentMessages.find((m) => m.botKind === 'driver');
+  assert.equal(notif.chatId, '-500');
+  assert.equal(notif.messageId, 100);
+  assert.equal(driver.chatId, '-700');
+  assert.equal(driver.messageId, 200);
+});
+
+test('deliverEvent reports hadVideoAtSend true when alert already carries video', async () => {
+  const deps = buildDeliverDeps();
+  const result = await deliverEvent(
+    { text: 'alert', videoUrl: 'https://f.mp4', samsaraEventId: 'evt-vid' },
+    deps,
+  );
+  assert.equal(result.hadVideoAtSend, true);
 });

@@ -24,14 +24,6 @@ function getVideoRetryDelayMs() {
   return Math.min(MAX_DELAY_MS, Math.max(MIN_DELAY_MS, parsed));
 }
 
-function shouldDeferVideoRetry(formattedAlert, eventId) {
-  if (!isVideoRetryEnabled()) return false;
-  if (!eventId) return false;
-  if (!formattedAlert || typeof formattedAlert !== 'object') return false;
-  if (formattedAlert.videoUrl || formattedAlert.inwardVideoUrl) return false;
-  return true;
-}
-
 function patchAlertVideoUrls(formattedAlert, urls) {
   if (!formattedAlert || !urls) return formattedAlert;
   if (urls.forwardUrl) formattedAlert.videoUrl = urls.forwardUrl;
@@ -189,49 +181,15 @@ async function runVideoRetrievalFlow(rawEvent, { apiKey, baseUrl } = {}) {
   return pollRetrievedVideoUrls({ ...params, apiKey, baseUrl });
 }
 
-function scheduleVideoRetryDelivery({
-  formattedAlert,
-  rawEvent,
-  eventId,
-  queueAlert,
-  delayMs,
-  apiKey,
-  baseUrl,
-  setTimer = (fn, ms) => setTimeout(fn, ms),
-  refetchFn,
-  retrievalFn,
-}) {
-  const waitMs = Number.isFinite(delayMs) ? delayMs : getVideoRetryDelayMs();
-  console.log(`[VideoRetry] deferring event ${eventId} for ${Math.round(waitMs / 1000)}s`);
-
-  const doRefetch = refetchFn
-    || (() => refetchVideoUrls(eventId, apiKey, baseUrl));
-  const doRetrieval = retrievalFn
-    || (() => runVideoRetrievalFlow(rawEvent, { apiKey, baseUrl }));
-
-  setTimer(async () => {
-    try {
-      let urls = await doRefetch();
-      if (urls?.forwardUrl || urls?.inwardUrl) {
-        patchAlertVideoUrls(formattedAlert, urls);
-        console.log(`[VideoRetry] event ${eventId}: video found after retry`);
-      } else {
-        console.log(`[VideoRetry] event ${eventId}: no video after retry, starting retrieval`);
-        urls = await doRetrieval();
-        if (urls?.forwardUrl || urls?.inwardUrl) {
-          patchAlertVideoUrls(formattedAlert, urls);
-          console.log(`[VideoRetry] event ${eventId}: video found after retrieval`);
-        } else {
-          console.log(`[VideoRetry] event ${eventId}: still no video after retrieval flow`);
-        }
-      }
-    } catch (err) {
-      console.warn(`[VideoRetry] event ${eventId}: video retry flow failed:`, err.message);
-    }
-    queueAlert(formattedAlert);
-  }, waitMs);
-}
-
+/**
+ * Queue a formatted alert for IMMEDIATE delivery.
+ *
+ * We no longer hold the notification back waiting for video. The alert is sent
+ * right away (text-only when the video has not uploaded yet). When video is
+ * missing and retry is enabled, we attach a `videoBackfill` descriptor so the
+ * delivery layer can, after the alert is sent, resolve/generate the video and
+ * post it as a reply to the original messages (see src/videoBackfill.js).
+ */
 function enqueueFormattedAlert(formattedAlert, rawEvent, queueAlert, options = {}) {
   if (!formattedAlert) return;
 
@@ -240,39 +198,32 @@ function enqueueFormattedAlert(formattedAlert, rawEvent, queueAlert, options = {
     formattedAlert.samsaraEventId = eventId;
   }
 
-  const apiKey = options.apiKey ?? process.env.SAMSARA_API_KEY;
-  const baseUrl = options.baseUrl ?? (process.env.SAMSARA_API_BASE || 'https://api.samsara.com');
-
-  if (!shouldDeferVideoRetry(formattedAlert, eventId)) {
-    queueAlert(formattedAlert);
-    return;
+  const hasVideo = Boolean(formattedAlert.videoUrl || formattedAlert.inwardVideoUrl);
+  if (!hasVideo && eventId && isVideoRetryEnabled()) {
+    // Carry what the backfill flow needs; the delivery layer reads this after
+    // the immediate send completes. `refetchFn`/`retrievalFn` let callers (e.g.
+    // the speeding poller) supply source-specific video resolution.
+    formattedAlert.videoBackfill = {
+      eventId,
+      rawEvent,
+      refetchFn: options.refetchFn || null,
+      retrievalFn: options.retrievalFn || null,
+      delayMs: options.delayMs,
+    };
   }
 
-  scheduleVideoRetryDelivery({
-    formattedAlert,
-    rawEvent,
-    eventId,
-    queueAlert,
-    delayMs: options.delayMs,
-    apiKey,
-    baseUrl,
-    setTimer: options.setTimer,
-    refetchFn: options.refetchFn,
-    retrievalFn: options.retrievalFn,
-  });
+  queueAlert(formattedAlert);
 }
 
 module.exports = {
   isVideoRetryEnabled,
   getVideoRetryDelayMs,
-  shouldDeferVideoRetry,
   patchAlertVideoUrls,
   refetchVideoUrls,
   inferVideoRetrievalParams,
   requestVideoRetrieval,
   pollRetrievedVideoUrls,
   runVideoRetrievalFlow,
-  scheduleVideoRetryDelivery,
   enqueueFormattedAlert,
   DEFAULT_DELAY_MS,
   MIN_DELAY_MS,
