@@ -150,7 +150,9 @@ async function deliverEvent(alertData, deps) {
       try {
         const sent = await sendNotificationToTarget(bot, chatId, alert, log);
         if (sent?.messageId) {
-          sentNotificationMessages.push({ botKind: 'notification', chatId, messageId: sent.messageId, type: sent.type });
+          // Carry the exact text that was sent so the video backfill can reuse
+          // it verbatim as the replacement message's caption (see videoBackfill).
+          sentNotificationMessages.push({ botKind: 'notification', chatId, messageId: sent.messageId, type: sent.type, caption: text });
         }
         await markSuccess(chatId);
         notificationsOk += 1;
@@ -215,6 +217,9 @@ async function deliverEvent(alertData, deps) {
             chatId: targetDriverGroupId,
             messageId: driverSent.messageId,
             type: driverSent.type,
+            // The driver group gets its own (possibly AI-rephrased) caption; keep
+            // it so the video backfill preserves that exact text on replacement.
+            caption: driverCaption,
           };
         }
         await markSuccess(targetDriverGroupId);

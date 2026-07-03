@@ -183,6 +183,10 @@ test('deliverEvent reports no video at send and returns sent message refs (text)
   assert.equal(notif.messageId, 100);
   assert.equal(driver.chatId, '-700');
   assert.equal(driver.messageId, 200);
+  // Each ref carries the exact caption text so the video backfill can preserve
+  // it verbatim when it folds the video into the original message.
+  assert.equal(notif.caption, 'alert');
+  assert.equal(driver.caption, 'alert');
 });
 
 test('deliverEvent reports hadVideoAtSend true when alert already carries video', async () => {

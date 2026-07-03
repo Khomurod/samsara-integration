@@ -4,15 +4,18 @@
  * When a Samsara safety event is delivered immediately but the dashcam video
  * was not yet available, this module comes back a short while later, resolves
  * the video (refetch the event → if still missing, trigger Samsara's media
- * retrieval/generation and poll for it), and posts the video as a REPLY to each
- * original alert message — in the Samsara notifications group, every subscriber,
- * and the matched driver group.
+ * retrieval/generation and poll for it), and folds the video INTO the original
+ * alert message — in the Samsara notifications group, every subscriber, and the
+ * matched driver group. The end state is a single clean notification that
+ * carries the original event text plus the video, not two separate messages.
  *
- * Why a reply instead of an in-place edit? Telegram cannot convert a text-only
- * message into a video message (`editMessageMedia` only works on messages that
- * already contain media). Replying to the original alert threads the video
- * directly under it, which is the reliable way to "add the video" after the
- * fact.
+ * How the "fold-in" works: Telegram cannot convert a text-only message into a
+ * media message in place (`editMessageMedia` only works on messages that
+ * already contain media). So we do the cleanest supported equivalent — send a
+ * new video message whose caption is the ORIGINAL notification text, then delete
+ * the original text-only message. The video is sent first and the delete second,
+ * so a failed send never loses the alert and a failed delete never loses the
+ * video.
  *
  * All collaborators are injected so the flow is unit-testable with no real
  * network or Telegram calls.
@@ -72,20 +75,43 @@ async function resolveEventVideoUrls({
   return { forwardUrl: null, inwardUrl: null };
 }
 
+// Telegram media captions are capped at 1024 chars (vs 4096 for a text message).
+// The standard safety-event notification is well under this, but guard anyway so
+// an unusually long text never causes Telegram to reject the whole video send.
+const TELEGRAM_CAPTION_LIMIT = 1024;
+
+function fitCaption(caption, log = console) {
+  if (typeof caption !== 'string' || caption.length <= TELEGRAM_CAPTION_LIMIT) {
+    return caption;
+  }
+  log.warn?.(
+    `[VideoBackfill] caption of ${caption.length} chars exceeds Telegram's `
+    + `${TELEGRAM_CAPTION_LIMIT}-char media caption limit; truncating for the video message`,
+  );
+  return `${caption.slice(0, TELEGRAM_CAPTION_LIMIT - 1)}…`;
+}
+
 /**
- * Post the resolved video as a reply to a single previously-sent alert message.
- * Falls through dual-camera → single video, and returns whether anything was
- * sent. A pure text fallback is intentionally NOT sent here — if the video
- * cannot be delivered we simply leave the original text alert untouched.
+ * Fold the resolved video into a single previously-sent, text-only alert:
+ * send a new video message whose caption is the ORIGINAL notification text,
+ * then delete the original text message so the group is left with one clean
+ * notification (text + video).
+ *
+ * Ordering is deliberate — the video is sent FIRST; only on success do we delete
+ * the original. So a failed video send leaves the original text alert untouched
+ * (no data loss, no duplicate video), and a failed delete still leaves the video
+ * delivered (worst case a stray text message, which is logged). Falls through
+ * dual-camera → single video. Returns whether the video was posted.
  */
-async function postVideoReply(bot, chatId, replyToMessageId, {
+async function replaceMessageWithVideo(bot, chatId, originalMessageId, {
   videoUrl,
   inwardVideoUrl,
   getVideoBuffer,
   caption,
   log = console,
 }) {
-  const replyOpts = replyToMessageId ? { reply_to_message_id: replyToMessageId } : {};
+  const cap = fitCaption(caption, log);
+  let sent = false;
 
   if (videoUrl && inwardVideoUrl) {
     try {
@@ -94,42 +120,58 @@ async function postVideoReply(bot, chatId, replyToMessageId, {
         getVideoBuffer(inwardVideoUrl),
       ]);
       await bot.sendMediaGroup(chatId, [
-        { type: 'video', media: 'attach://forward', caption, parse_mode: 'HTML' },
+        { type: 'video', media: 'attach://forward', caption: cap, parse_mode: 'HTML' },
         { type: 'video', media: 'attach://inward' },
-      ], replyOpts, {
+      ], {}, {
         forward: { value: forwardBuf, options: { filename: 'forward.mp4', contentType: 'video/mp4' } },
         inward: { value: inwardBuf, options: { filename: 'inward.mp4', contentType: 'video/mp4' } },
       });
-      return true;
+      sent = true;
     } catch (dualErr) {
-      log.error?.(`[VideoBackfill] dual-camera reply to ${chatId} failed, trying single: ${dualErr.message}`);
+      log.error?.(`[VideoBackfill] dual-camera replace in ${chatId} failed, trying single: ${dualErr.message}`);
     }
   }
 
-  if (videoUrl || inwardVideoUrl) {
+  if (!sent && (videoUrl || inwardVideoUrl)) {
     const singleUrl = videoUrl || inwardVideoUrl;
     try {
       const buffer = await getVideoBuffer(singleUrl);
       await bot.sendVideo(chatId, buffer, {
-        caption,
+        caption: cap,
         parse_mode: 'HTML',
-        ...replyOpts,
       }, {
         filename: 'event.mp4',
         contentType: 'video/mp4',
       });
-      return true;
+      sent = true;
     } catch (videoErr) {
-      log.error?.(`[VideoBackfill] single-video reply to ${chatId} failed: ${videoErr.message}`);
+      log.error?.(`[VideoBackfill] single-video replace in ${chatId} failed: ${videoErr.message}`);
     }
   }
 
-  return false;
+  if (!sent) return false;
+
+  // Video delivered as a new message carrying the original text as its caption.
+  // Remove the original text-only alert so the group keeps a single message.
+  if (originalMessageId != null && typeof bot.deleteMessage === 'function') {
+    try {
+      await bot.deleteMessage(chatId, originalMessageId);
+      log.log?.(`[VideoBackfill] replaced original message ${originalMessageId} in ${chatId} with a video notification`);
+    } catch (delErr) {
+      log.warn?.(
+        `[VideoBackfill] video posted to ${chatId} but deleting original message `
+        + `${originalMessageId} failed: ${delErr.message}`,
+      );
+    }
+  }
+
+  return true;
 }
 
 /**
- * Post the resolved video as a reply to every recorded alert message, using the
- * bot appropriate to each target (notification bot vs. driver bot).
+ * Fold the resolved video into every recorded alert message, using the bot
+ * appropriate to each target (notification bot vs. driver bot). Each message is
+ * replaced with a video that keeps that target's own original caption text.
  */
 async function runVideoBackfill({
   sentMessages,
@@ -150,26 +192,32 @@ async function runVideoBackfill({
     if (!bot) continue;
     attempted += 1;
     try {
-      const ok = await postVideoReply(bot, ref.chatId, ref.messageId, {
+      const ok = await replaceMessageWithVideo(bot, ref.chatId, ref.messageId, {
         videoUrl: videoUrls.forwardUrl,
         inwardVideoUrl: videoUrls.inwardUrl,
         getVideoBuffer,
-        caption,
+        // Prefer the exact text that was sent to THIS target; fall back to the
+        // generic caption only if a ref somehow carries none.
+        caption: ref.caption || caption,
         log,
       });
       if (ok) posted += 1;
     } catch (err) {
-      log.error?.(`[VideoBackfill] reply to ${ref.chatId} threw: ${err.message}`);
+      log.error?.(`[VideoBackfill] replace in ${ref.chatId} threw: ${err.message}`);
     }
   }
   return { posted, attempted };
 }
 
+// Fallback caption only — the backfill normally reuses each target's original
+// notification text (carried on the sentMessages refs). This is used solely if a
+// ref somehow arrives without its caption, so the video is never sent uncaptioned.
 const DEFAULT_BACKFILL_CAPTION = '🎥 <b>Event video is now available.</b>';
 
 /**
- * Schedule the video backfill: after a delay, resolve the video and reply to the
- * original alert messages with it. Returns true if a backfill was scheduled.
+ * Schedule the video backfill: after a delay, resolve the video and fold it into
+ * the original alert messages (send video with the original text as caption, then
+ * delete the original text message). Returns true if a backfill was scheduled.
  */
 function scheduleVideoBackfill({
   eventId,
@@ -206,16 +254,17 @@ function scheduleVideoBackfill({
         eventId, rawEvent, apiKey, baseUrl, refetchFn, retrievalFn, log,
       });
       if (!urls.forwardUrl && !urls.inwardUrl) {
-        log.log?.(`[VideoBackfill] event ${eventId}: still no video after backfill; leaving text alerts as-is`);
+        log.log?.(`[VideoBackfill] event ${eventId}: video never became available; leaving text alerts as-is`);
         return;
       }
+      log.log?.(`[VideoBackfill] event ${eventId}: video available, folding into ${sentMessages.length} original message(s)`);
       const getVideoBuffer = typeof makeGetVideoBuffer === 'function' ? makeGetVideoBuffer() : null;
       if (!getVideoBuffer) {
         log.warn?.(`[VideoBackfill] event ${eventId}: no video downloader available, cannot post backfill`);
         return;
       }
       const res = await runVideoBackfill({ sentMessages, videoUrls: urls, resolveBot, getVideoBuffer, caption, log });
-      log.log?.(`[VideoBackfill] event ${eventId}: posted video to ${res.posted}/${res.attempted} target(s)`);
+      log.log?.(`[VideoBackfill] event ${eventId}: folded video into ${res.posted}/${res.attempted} target message(s)`);
     } catch (err) {
       log.warn?.(`[VideoBackfill] event ${eventId}: backfill flow failed: ${err.message}`);
     } finally {
@@ -229,9 +278,11 @@ function scheduleVideoBackfill({
 module.exports = {
   isVideoBackfillEnabled,
   resolveEventVideoUrls,
-  postVideoReply,
+  replaceMessageWithVideo,
   runVideoBackfill,
   scheduleVideoBackfill,
+  fitCaption,
   DEFAULT_BACKFILL_CAPTION,
+  TELEGRAM_CAPTION_LIMIT,
   _forTest: { inFlight },
 };
