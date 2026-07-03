@@ -45,15 +45,20 @@ the service now:
 3. **If it is still missing, it generates the video itself** by triggering
    Samsara media retrieval (`POST /cameras/media/retrieval`) and polling
    `GET /cameras/media` until the clip is produced.
-4. **Attaches the video to the messages already sent** by posting it as a
-   **reply** to the original alert — in the "Samsara Notifications" group, every
-   subscriber, **and** the matched driver group.
+4. **Folds the video into the messages already sent** so each destination ends
+   up with a **single clean notification** — the original event text **plus** the
+   video — in the "Samsara Notifications" group, every subscriber, **and** the
+   matched driver group. No separate follow-up message is posted.
 
-> **Why a reply and not an in-place edit?** Telegram cannot turn an existing
-> *text* message into a *video* message (`editMessageMedia` only works on
-> messages that already contain media). Replying to the original alert threads
-> the video directly under it, which is the reliable way to "add the video"
-> after the fact.
+> **How the fold-in works.** Telegram cannot turn an existing *text* message
+> into a *video* message in place (`editMessageMedia` only works on messages that
+> already contain media). So the backfill does the cleanest supported
+> equivalent: it **sends a new video message whose caption is the original
+> notification text, then deletes the original text-only message**. The video is
+> sent first and the delete second, so a failed send never loses the alert and a
+> failed delete never loses the video. The driver group keeps its own
+> (AI-rephrased) caption. Captions longer than Telegram's 1024-char media limit
+> are truncated for the video message (the standard alert is well under this).
 
 Set `SAMSARA_VIDEO_RETRY_ENABLED=false` to disable the backfill entirely
 (text-only alerts, never enriched with video).
