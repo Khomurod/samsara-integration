@@ -95,6 +95,15 @@ function clearCursorInternal() {
 
 module.exports = {
     /**
+     * Expose the shared Postgres pool (or null when DATABASE_URL is unset) so
+     * cooperating modules (e.g. the safety-event music-overlay reader) can reuse
+     * the SAME connection pool instead of opening a second one.
+     */
+    getPgPool() {
+        return pgPool;
+    },
+
+    /**
      * Get the last saved cursor.
      * @returns {string|null} The cursor string, or null if none saved.
      */
@@ -282,6 +291,29 @@ module.exports = {
                     status VARCHAR(32) NOT NULL DEFAULT 'delivered',
                     updated_at TIMESTAMP DEFAULT NOW(),
                     PRIMARY KEY (event_id, target_chat_id)
+                )`);
+                // Observability ledger for driver-group music-overlay jobs. The
+                // admin/hub (bot-backend) owns the canonical DDL in schema.sql;
+                // this IF NOT EXISTS mirror lets the poller run and record jobs
+                // even if it boots first. Keep the columns/constraints in sync
+                // with bot-backend/database/schema.sql.
+                await pgPool.query(`CREATE TABLE IF NOT EXISTS safety_event_video_jobs (
+                    id BIGSERIAL PRIMARY KEY,
+                    samsara_event_id TEXT NULL,
+                    telegram_group_id BIGINT NULL,
+                    music_asset_id INTEGER NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','processing','sent','failed','fallback_sent','skipped')),
+                    video_source TEXT NULL
+                        CHECK (video_source IS NULL OR video_source IN ('immediate','backfill')),
+                    video_reference TEXT NULL,
+                    video_duration_seconds NUMERIC(10,3) NULL,
+                    music_trim_mode TEXT NULL
+                        CHECK (music_trim_mode IS NULL OR music_trim_mode IN ('trim','loop','once')),
+                    error_message TEXT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    started_at TIMESTAMPTZ NULL,
+                    finished_at TIMESTAMPTZ NULL
                 )`);
                 console.log('[DB] PostgreSQL deduplication + delivery-ledger tables ready.');
             } catch (err) {

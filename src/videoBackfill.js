@@ -108,10 +108,25 @@ async function replaceMessageWithVideo(bot, chatId, originalMessageId, {
   inwardVideoUrl,
   getVideoBuffer,
   caption,
+  // Optional driver-group-only music overlay (see driverGroupDelivery). No-op
+  // when absent — used only for driver-group backfill sends.
+  prepareVideo = null,
+  videoContext = {},
   log = console,
 }) {
   const cap = fitCaption(caption, log);
   let sent = false;
+
+  const applyMusic = async (buffer, role) => {
+    if (!buffer || typeof prepareVideo !== 'function') return buffer;
+    try {
+      const out = await prepareVideo(buffer, { ...videoContext, role });
+      return Buffer.isBuffer(out) && out.length > 0 ? out : buffer;
+    } catch (err) {
+      log.error?.(`[VideoBackfill] music overlay failed in ${chatId} (${err.message}); using original video.`);
+      return buffer;
+    }
+  };
 
   if (videoUrl && inwardVideoUrl) {
     try {
@@ -119,11 +134,12 @@ async function replaceMessageWithVideo(bot, chatId, originalMessageId, {
         getVideoBuffer(videoUrl),
         getVideoBuffer(inwardVideoUrl),
       ]);
+      const forwardOut = await applyMusic(forwardBuf, 'forward');
       await bot.sendMediaGroup(chatId, [
         { type: 'video', media: 'attach://forward', caption: cap, parse_mode: 'HTML' },
         { type: 'video', media: 'attach://inward' },
       ], {}, {
-        forward: { value: forwardBuf, options: { filename: 'forward.mp4', contentType: 'video/mp4' } },
+        forward: { value: forwardOut, options: { filename: 'forward.mp4', contentType: 'video/mp4' } },
         inward: { value: inwardBuf, options: { filename: 'inward.mp4', contentType: 'video/mp4' } },
       });
       sent = true;
@@ -136,7 +152,8 @@ async function replaceMessageWithVideo(bot, chatId, originalMessageId, {
     const singleUrl = videoUrl || inwardVideoUrl;
     try {
       const buffer = await getVideoBuffer(singleUrl);
-      await bot.sendVideo(chatId, buffer, {
+      const outBuffer = await applyMusic(buffer, 'single');
+      await bot.sendVideo(chatId, outBuffer, {
         caption: cap,
         parse_mode: 'HTML',
       }, {
@@ -179,6 +196,10 @@ async function runVideoBackfill({
   resolveBot,
   getVideoBuffer,
   caption,
+  // Driver-group-only music overlay (applied ONLY to refs with botKind==='driver').
+  prepareDriverVideo = null,
+  isSpeeding = false,
+  eventId = null,
   log = console,
 }) {
   if (!videoUrls || (!videoUrls.forwardUrl && !videoUrls.inwardUrl)) {
@@ -191,6 +212,9 @@ async function runVideoBackfill({
     const bot = typeof resolveBot === 'function' ? resolveBot(ref.botKind) : null;
     if (!bot) continue;
     attempted += 1;
+    // The music overlay is applied ONLY to the driver-group copy. Notification-
+    // group / subscriber backfills always get the original video.
+    const isDriver = ref.botKind === 'driver';
     try {
       const ok = await replaceMessageWithVideo(bot, ref.chatId, ref.messageId, {
         videoUrl: videoUrls.forwardUrl,
@@ -199,6 +223,10 @@ async function runVideoBackfill({
         // Prefer the exact text that was sent to THIS target; fall back to the
         // generic caption only if a ref somehow carries none.
         caption: ref.caption || caption,
+        prepareVideo: isDriver ? prepareDriverVideo : null,
+        videoContext: isDriver
+          ? { isSpeeding, eventId, groupId: ref.chatId, source: 'backfill' }
+          : {},
         log,
       });
       if (ok) posted += 1;
@@ -232,6 +260,9 @@ function scheduleVideoBackfill({
   setTimer = (fn, ms) => setTimeout(fn, ms),
   refetchFn,
   retrievalFn,
+  // Driver-group-only music overlay + speeding flag, threaded to runVideoBackfill.
+  prepareDriverVideo = null,
+  isSpeeding = false,
   log = console,
 }) {
   if (!eventId) return false;
@@ -263,7 +294,10 @@ function scheduleVideoBackfill({
         log.warn?.(`[VideoBackfill] event ${eventId}: no video downloader available, cannot post backfill`);
         return;
       }
-      const res = await runVideoBackfill({ sentMessages, videoUrls: urls, resolveBot, getVideoBuffer, caption, log });
+      const res = await runVideoBackfill({
+        sentMessages, videoUrls: urls, resolveBot, getVideoBuffer, caption,
+        prepareDriverVideo, isSpeeding, eventId, log,
+      });
       log.log?.(`[VideoBackfill] event ${eventId}: folded video into ${res.posted}/${res.attempted} target message(s)`);
     } catch (err) {
       log.warn?.(`[VideoBackfill] event ${eventId}: backfill flow failed: ${err.message}`);
