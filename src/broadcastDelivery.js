@@ -91,6 +91,10 @@ async function deliverEvent(alertData, deps) {
     forcedId,
     managementGroupId,
     getVideoBuffer,
+    // Optional DRIVER-GROUP-only video transform (music overlay). When present it
+    // is handed to sendDriverGroupAlert and applied to the driver group's video
+    // copy only. The notifications group / subscribers path never receives it.
+    prepareDriverVideo = null,
     log = console,
   } = deps;
 
@@ -99,6 +103,9 @@ async function deliverEvent(alertData, deps) {
   const inwardVideoUrl = typeof alertData === 'string' ? null : alertData.inwardVideoUrl;
   const eventId = typeof alertData === 'string' ? null : alertData.samsaraEventId;
   const alertObj = typeof alertData === 'string' ? {} : alertData;
+  // Speeding events are tagged by the speeding poller; the music overlay is
+  // scoped to speeding events only.
+  const isSpeeding = typeof alertData === 'string' ? false : alertData.isSpeeding === true;
 
   // Durable per-target ledger for this event (empty when no eventId / no DB).
   const statuses = await tracker.getTargetStatuses(eventId);
@@ -210,6 +217,14 @@ async function deliverEvent(alertData, deps) {
           videoUrl,
           inwardVideoUrl,
           getVideoBuffer,
+          // Driver-group-only music overlay (no-op unless wired + enabled + speeding).
+          prepareVideo: prepareDriverVideo,
+          videoContext: {
+            isSpeeding,
+            eventId,
+            groupId: targetDriverGroupId,
+            source: 'immediate',
+          },
         });
         if (driverSent?.messageId) {
           driverSentMessage = {

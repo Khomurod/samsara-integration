@@ -483,6 +483,10 @@ async function executePoll() {
           formatted.vehicleId = transformed.vehicleId || null;
           formatted.driverName = transformed.driverName || null;
           formatted.samsaraEventId = eventId;
+          // Tag as a speeding event so the delivery layer can scope the
+          // driver-group music overlay to speeding videos only. The Samsara
+          // notifications group is unaffected regardless of this flag.
+          formatted.isSpeeding = true;
 
           const directVideoUrl = rawEvent.downloadForwardVideoUrl || rawEvent.media?.[0]?.url || null;
           if (directVideoUrl) {

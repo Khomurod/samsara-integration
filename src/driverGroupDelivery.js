@@ -5,25 +5,52 @@
  * later reply to it (e.g. to attach the dashcam video once it becomes
  * available): `{ messageId, type }` where type is 'caption' (a video message)
  * or 'text' (a plain text fallback).
+ *
+ * DRIVER-GROUP MUSIC OVERLAY: an optional `prepareVideo(buffer, { role, ... })`
+ * transform may be supplied. When present it is applied to the driver-group
+ * video bytes BEFORE sending (e.g. to embed background music into speeding-event
+ * clips). It must never throw and must return a valid video Buffer — on any
+ * problem it returns the original bytes so the driver group still gets the clip.
+ * This is BRANCH B only; the notifications-group path (broadcastDelivery's
+ * sendNotificationToTarget) does NOT use it and is never affected.
  */
 async function sendDriverGroupAlert(driverBot, groupId, {
     caption,
     videoUrl,
     inwardVideoUrl,
     getVideoBuffer,
+    prepareVideo = null,
+    videoContext = {},
     log = console,
 }) {
+    // Apply the optional music overlay to a driver-group video buffer. Defensive:
+    // prepareVideo is expected to swallow its own errors, but we guard anyway so
+    // a bug there can never drop the video.
+    const applyMusic = async (buffer, role) => {
+        if (!buffer || typeof prepareVideo !== 'function') return buffer;
+        try {
+            const out = await prepareVideo(buffer, { ...videoContext, role });
+            return Buffer.isBuffer(out) && out.length > 0 ? out : buffer;
+        } catch (err) {
+            log.error?.(`[Bot] Driver music overlay failed (${err.message}); using original video.`);
+            return buffer;
+        }
+    };
+
     if (videoUrl && inwardVideoUrl) {
         try {
             const [forwardBuf, inwardBuf] = await Promise.all([
                 getVideoBuffer(videoUrl),
                 getVideoBuffer(inwardVideoUrl),
             ]);
+            // Only the forward/road camera gets music; inward stays original to
+            // avoid two overlapping music tracks in the same media group.
+            const forwardOut = await applyMusic(forwardBuf, 'forward');
             const mediaMessages = await driverBot.sendMediaGroup(groupId, [
                 { type: 'video', media: 'attach://forward', caption, parse_mode: 'HTML' },
                 { type: 'video', media: 'attach://inward' },
             ], {}, {
-                forward: { value: forwardBuf, options: { filename: 'forward.mp4', contentType: 'video/mp4' } },
+                forward: { value: forwardOut, options: { filename: 'forward.mp4', contentType: 'video/mp4' } },
                 inward: { value: inwardBuf, options: { filename: 'inward.mp4', contentType: 'video/mp4' } },
             });
             const messageId = Array.isArray(mediaMessages) ? mediaMessages[0]?.message_id : undefined;
@@ -36,7 +63,8 @@ async function sendDriverGroupAlert(driverBot, groupId, {
     if (videoUrl) {
         try {
             const buffer = await getVideoBuffer(videoUrl);
-            const sentVideo = await driverBot.sendVideo(groupId, buffer, {
+            const outBuffer = await applyMusic(buffer, 'single');
+            const sentVideo = await driverBot.sendVideo(groupId, outBuffer, {
                 caption,
                 parse_mode: 'HTML',
             }, {

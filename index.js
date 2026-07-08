@@ -23,10 +23,20 @@ const {
 const { deliverEvent } = require('./src/broadcastDelivery');
 const { createDeliveryTracker, classifyTelegramError } = require('./src/deliveryTracker');
 const { scheduleVideoBackfill } = require('./src/videoBackfill');
+const { createSafetyEventVideoStore } = require('./src/safetyEventVideoSettings');
+const { createDriverVideoProcessor } = require('./src/safetyEventVideoMusicService');
 
 // Durable per-(event, target) delivery ledger — the source of truth for
 // "already sent, do not send again".
 const deliveryTracker = createDeliveryTracker(samsaraDb);
+
+// DRIVER-GROUP music overlay (Branch B only). Reads settings + active music from
+// the SHARED Postgres DB (written by the admin/hub) and embeds music into the
+// driver group's speeding-video copy. It NEVER touches the notifications-group
+// path and always falls back to the original video on any failure or when
+// disabled / ffmpeg is unavailable.
+const safetyVideoStore = createSafetyEventVideoStore({ pool: samsaraDb.getPgPool(), log: console });
+const driverVideoProcessor = createDriverVideoProcessor({ store: safetyVideoStore, log: console });
 
 // The Samsara notification bot's OWN token (e.g. @wenzesambot). Prefer the
 // explicit SAMSARA_BOT_TOKEN when set — this bot is what must be a member of
@@ -188,6 +198,10 @@ async function broadcast(alertData) {
             forcedId,
             managementGroupId: MANAGEMENT_GROUP_ID,
             getVideoBuffer,
+            // Driver-group-only music overlay. Applied inside sendDriverGroupAlert
+            // to the driver group's video copy; the notifications group is never
+            // routed through this.
+            prepareDriverVideo: driverVideoProcessor.prepareDriverVideoBuffer,
             log: console,
         });
     } finally {
@@ -226,6 +240,9 @@ async function broadcast(alertData) {
             refetchFn: backfill.refetchFn || undefined,
             retrievalFn: backfill.retrievalFn || undefined,
             delayMs: backfill.delayMs,
+            // Driver-group-only music overlay for the backfilled video copy.
+            prepareDriverVideo: driverVideoProcessor.prepareDriverVideoBuffer,
+            isSpeeding: Boolean(alertData && typeof alertData === 'object' && alertData.isSpeeding),
         });
     }
 }

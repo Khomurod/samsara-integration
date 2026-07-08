@@ -69,6 +69,65 @@ backfilled (the text alert was already delivered and is never re-sent).
 
 ---
 
+## Driver-group speeding-video music overlay (optional)
+
+For **speeding events only**, the copy of the dashcam video sent to the **matched
+driver group** can have background music embedded. This is configured and the
+music is uploaded from the **admin/hub** (`bot-backend`) panel under
+**Settings → Safety Event Music**; this poller reads the settings + active music
+clip from the **shared database** and does the ffmpeg overlay just before the
+driver-group send.
+
+**Two clearly separate branches — the notifications group is never touched:**
+
+- **Branch A — Samsara Notifications group + subscribers:** original video,
+  sent **immediately and unchanged**. No music, no ffmpeg, no added delay. This
+  path is not routed through the overlay at all.
+- **Branch B — matched driver group:** if enabled + a speeding event + an active
+  music clip + ffmpeg present, the video is downloaded, music is embedded, and
+  the processed copy is sent. **On any problem the original video is sent
+  instead** — the driver group never loses the clip because of music processing.
+
+Duration handling: output length always equals the video length. Music longer
+than the video is trimmed; music shorter is looped to fill (or played once with
+a silent tail, per setting). The video stream is copied (`-c:v copy`), so
+dimensions/quality are preserved and only the audio is re-encoded. For
+dual-camera media groups only the forward camera gets music (the inward stays
+original) to avoid two overlapping tracks. Temp files are always cleaned up.
+
+### ffmpeg requirement
+
+The overlay needs **`ffmpeg`** (and `ffprobe`) at runtime. Render's `env: node`
+runtime does **not** include them by default, so pick one:
+
+1. **`ffmpeg-static` (simplest, no system install):**
+   ```bash
+   npm install ffmpeg-static @ffprobe-installer/ffprobe
+   ```
+   The code auto-detects these packages — no config needed.
+2. **System install (Docker / apt-based host):** `apt-get install -y ffmpeg`,
+   then it is found on `PATH`.
+3. **Explicit path:** set `FFMPEG_PATH` (and optionally `FFPROBE_PATH`) to the
+   binary locations.
+
+**If ffmpeg is unavailable the feature simply no-ops** — every driver-group video
+is sent as the original, and a one-time warning is logged. Nothing else breaks.
+
+Overlay-related environment variables:
+
+| Var | Purpose |
+|---|---|
+| `FFMPEG_PATH` | Path to the `ffmpeg` binary (default: `ffmpeg-static` package → `ffmpeg` on PATH). |
+| `FFPROBE_PATH` | Path to the `ffprobe` binary (default: `@ffprobe-installer/ffprobe`/`ffprobe-static` → `ffprobe` on PATH). |
+| `SAFETY_MUSIC_FFMPEG_TIMEOUT_MS` | Hard timeout per ffmpeg run (default 60000). |
+
+All other behaviour (enable/disable, volume, fades, mix-vs-replace original
+audio, loop, max video length) is controlled from the admin panel and stored in
+`safety_event_video_settings`. Overlay attempts are recorded (best-effort) in
+`safety_event_video_jobs`.
+
+---
+
 ## File Structure
 
 ```
