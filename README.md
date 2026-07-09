@@ -98,33 +98,77 @@ original) to avoid two overlapping tracks. Temp files are always cleaned up.
 ### ffmpeg requirement
 
 The overlay needs **`ffmpeg`** (and `ffprobe`) at runtime. Render's `env: node`
-runtime does **not** include them by default, so pick one:
+runtime does **not** include them, so the binaries are now shipped as regular
+npm **dependencies** (installed automatically by `npm install`):
 
-1. **`ffmpeg-static` (simplest, no system install):**
-   ```bash
-   npm install ffmpeg-static @ffprobe-installer/ffprobe
-   ```
-   The code auto-detects these packages — no config needed.
-2. **System install (Docker / apt-based host):** `apt-get install -y ffmpeg`,
-   then it is found on `PATH`.
-3. **Explicit path:** set `FFMPEG_PATH` (and optionally `FFPROBE_PATH`) to the
-   binary locations.
+```jsonc
+// package.json → dependencies
+"@ffmpeg-installer/ffmpeg": "^1.1.0",
+"@ffprobe-installer/ffprobe": "^2.1.2"
+```
 
-**If ffmpeg is unavailable the feature simply no-ops** — every driver-group video
-is sent as the original, and a one-time warning is logged. Nothing else breaks.
+> These installer packages fetch platform binaries from the **npm registry**
+> (no external GitHub download at install time), so a plain `npm install` build
+> on Render provisions ffmpeg reliably. This closes the previous gap where the
+> README asked you to install ffmpeg manually but nothing did — so the overlay
+> silently no-op'd on Render and every driver-group video went out with no music.
+
+Alternatives (still supported, in resolution order):
+1. **Bundled installer packages** (default now) — nothing to configure.
+2. **System install (Docker / apt host):** `apt-get install -y ffmpeg` → found on `PATH`.
+3. **Explicit path:** set `FFMPEG_PATH` / `FFPROBE_PATH` to the binaries. These
+   win over the packages, so you can pin a specific build.
+
+**If ffmpeg is still unavailable the feature simply no-ops** — every driver-group
+video is sent as the original and a warning is logged. Nothing else breaks.
 
 Overlay-related environment variables:
 
 | Var | Purpose |
 |---|---|
-| `FFMPEG_PATH` | Path to the `ffmpeg` binary (default: `ffmpeg-static` package → `ffmpeg` on PATH). |
-| `FFPROBE_PATH` | Path to the `ffprobe` binary (default: `@ffprobe-installer/ffprobe`/`ffprobe-static` → `ffprobe` on PATH). |
+| `FFMPEG_PATH` | Override path to `ffmpeg` (default: `@ffmpeg-installer/ffmpeg` → `ffmpeg-static` → `ffmpeg` on PATH). |
+| `FFPROBE_PATH` | Override path to `ffprobe` (default: `@ffprobe-installer/ffprobe` → `ffprobe-static` → `ffprobe` on PATH). |
 | `SAFETY_MUSIC_FFMPEG_TIMEOUT_MS` | Hard timeout per ffmpeg run (default 60000). |
 
 All other behaviour (enable/disable, volume, fades, mix-vs-replace original
 audio, loop, max video length) is controlled from the admin panel and stored in
 `safety_event_video_settings`. Overlay attempts are recorded (best-effort) in
 `safety_event_video_jobs`.
+
+### How to enable
+
+1. In `bot-backend` admin → **Settings → Safety Event Music**: upload a clip
+   (it becomes active), tick **Enable driver-group music overlay**, keep **Apply
+   to speeding events** on, and **Save**.
+2. Confirm both services share the **same `DATABASE_URL`** (this poller only
+   reads the settings + music bytes; the admin owns the tables).
+3. Redeploy/restart this poller so `npm install` provisions ffmpeg.
+
+### How to verify (from logs — no secrets/URLs are printed)
+
+On startup this service logs a readiness block:
+
+```
+[SafetyVideo] Readiness: DATABASE_URL/pool present.
+[SafetyVideo] Readiness: ffmpeg available (path=…/@ffmpeg-installer/linux-x64/ffmpeg).
+[SafetyVideo] Readiness: driver-group music ENABLED; active music asset id=3.
+```
+
+If music is off you get the exact reason, e.g. `driver_group_music_enabled is
+FALSE`, `no active_music_asset_id set`, `active music row/bytes missing`, or `no
+database pool`. Per-event logs then show `overlaying music …` and `overlay ok`,
+or `overlay failed (…); sending original video`. The admin panel’s
+**Overlay diagnostics** card (Settings → Safety Event Music) surfaces the same
+`safety_event_video_jobs` rows without opening Render logs.
+
+### What `fallback_sent` means
+
+A `safety_event_video_jobs` row with `status = 'fallback_sent'` means the overlay
+was attempted but could not complete (no ffmpeg, probe/encode failure, timeout,
+or the video exceeded `max_video_seconds`), **so the driver group received the
+ORIGINAL, unmodified video** — the clip is never dropped. `error_message` holds
+the short reason. `status = 'sent'` means music was embedded successfully;
+`processing` is an in-flight/interrupted attempt.
 
 ---
 

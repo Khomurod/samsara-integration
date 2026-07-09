@@ -12,6 +12,8 @@ const {
   buildFfmpegArgs,
   parseDurationFromStderr,
   musicExtFromMime,
+  makeFfmpeg: realMakeFfmpeg,
+  runOverlaySelfTest,
 } = require('../src/safetyEventVideoMusicService');
 
 // ── Pure helpers ────────────────────────────────────────────────────────────
@@ -230,4 +232,30 @@ test('processor replaces audio (no amix) when the video has no original audio', 
   const s = capturedArgs.join(' ');
   assert.doesNotMatch(s, /amix/);
   assert.match(s, /-map 1:a:0/);
+});
+
+// ── End-to-end overlay self-test with a REAL ffmpeg (skips if unavailable) ───
+// Proves the overlay pipeline actually runs against a real binary when one is
+// present (e.g. @ffmpeg-installer/ffmpeg installed, or FFMPEG_PATH set). When no
+// ffmpeg is available it reports ffmpegAvailable:false and the test SKIPS with a
+// clear message rather than failing — so CI without ffmpeg stays green.
+test('runOverlaySelfTest overlays synthetic media end-to-end when ffmpeg is available', async (t) => {
+  const ff = realMakeFfmpeg();
+  if (!(await ff.isAvailable())) {
+    t.skip('ffmpeg not available in this environment — install @ffmpeg-installer/ffmpeg or set FFMPEG_PATH to exercise this');
+    return;
+  }
+  const result = await runOverlaySelfTest({ ffmpeg: ff, log: { log() {}, warn() {}, error() {} } });
+  assert.equal(result.ffmpegAvailable, true);
+  assert.equal(result.ok, true, `overlay self-test should succeed: ${result.reason || ''}`);
+  assert.ok(result.outputBytes > 0, 'overlay produced a non-empty output video');
+});
+
+test('runOverlaySelfTest reports ffmpegAvailable:false (no throw) when ffmpeg is missing', async () => {
+  // Force an unavailable binary via a bogus FFMPEG_PATH-based facade.
+  const ff = realMakeFfmpeg({ ffmpegPath: '/nonexistent/ffmpeg', ffprobePath: '/nonexistent/ffprobe', log: { warn() {} } });
+  const result = await runOverlaySelfTest({ ffmpeg: ff, log: { log() {}, warn() {}, error() {} } });
+  assert.equal(result.ffmpegAvailable, false);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'ffmpeg-unavailable');
 });

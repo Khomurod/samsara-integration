@@ -46,7 +46,10 @@ function resolveBinary(envVar, staticPkgs, fallback) {
 }
 
 function resolveFfmpegPath() {
-  return resolveBinary('FFMPEG_PATH', ['ffmpeg-static'], 'ffmpeg');
+  // @ffmpeg-installer/ffmpeg ships the binary via the npm registry (per-platform
+  // optional deps, no external download) so it installs reliably on Render.
+  // ffmpeg-static is kept as a secondary fallback for older deployments.
+  return resolveBinary('FFMPEG_PATH', ['@ffmpeg-installer/ffmpeg', 'ffmpeg-static'], 'ffmpeg');
 }
 function resolveFfprobePath() {
   return resolveBinary('FFPROBE_PATH', ['@ffprobe-installer/ffprobe', 'ffprobe-static'], 'ffprobe');
@@ -363,6 +366,70 @@ function createDriverVideoProcessor({ store, ffmpeg = makeFfmpeg(), tmpDir, log 
   return { prepareDriverVideoBuffer, ffmpeg };
 }
 
+/**
+ * End-to-end self-test of the overlay pipeline using SYNTHETIC media (no network,
+ * no DB, no real dashcam clip). Generates a tiny 1s test video + 2s tone with
+ * ffmpeg's built-in lavfi sources, then runs the exact buildFfmpegArgs() overlay
+ * and verifies a non-empty output. Never throws.
+ *
+ * @returns {Promise<{ok:boolean, ffmpegAvailable:boolean, reason?:string,
+ *   outputBytes?:number, ffmpegPath?:string, ffprobePath?:string}>}
+ */
+async function runOverlaySelfTest({ ffmpeg = makeFfmpeg(), tmpDir, log = console } = {}) {
+  if (!(await ffmpeg.isAvailable())) {
+    return { ok: false, ffmpegAvailable: false, reason: 'ffmpeg-unavailable' };
+  }
+  let workDir = null;
+  try {
+    workDir = makeTempDir(tmpDir);
+    const videoPath = path.join(workDir, 'sample.mp4');
+    const musicPath = path.join(workDir, 'sample.m4a');
+    const outPath = path.join(workDir, 'out.mp4');
+
+    // 1s silent test video (mpeg4 is always built into ffmpeg).
+    await ffmpeg.run([
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x240:rate=15',
+      '-c:v', 'mpeg4', '-t', '1', videoPath,
+    ]);
+    // 2s tone as the "music" (longer than the video → exercises the trim path).
+    await ffmpeg.run([
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2',
+      '-c:a', 'aac', musicPath,
+    ]);
+
+    const { durationSeconds: videoDuration, hasAudio } = await ffmpeg.probe(videoPath);
+    const { durationSeconds: musicDuration } = await ffmpeg.probe(musicPath);
+    const plan = chooseMusicPlan({
+      videoDurationSeconds: videoDuration,
+      musicDurationSeconds: musicDuration,
+      loopWhenLonger: true,
+    });
+    const args = buildFfmpegArgs({
+      videoPath, musicPath, outPath,
+      videoDurationSeconds: videoDuration || 1,
+      hasOriginalAudio: hasAudio,
+      settings: { musicVolume: 0.35, fadeInSeconds: 0, fadeOutSeconds: 0, preserveOriginalAudio: false },
+      plan,
+    });
+    await ffmpeg.run(args);
+    const outBuf = fs.readFileSync(outPath);
+    return {
+      ok: outBuf.length > 0,
+      ffmpegAvailable: true,
+      outputBytes: outBuf.length,
+      ffmpegPath: ffmpeg.ffmpegPath,
+      ffprobePath: ffmpeg.ffprobePath,
+    };
+  } catch (err) {
+    log.warn?.(`[SafetyVideo] overlay self-test failed: ${err.message}`);
+    return { ok: false, ffmpegAvailable: true, reason: String(err.message).slice(0, 200) };
+  } finally {
+    safeUnlinkDir(workDir, log);
+  }
+}
+
 module.exports = {
   createDriverVideoProcessor,
   makeFfmpeg,
@@ -372,4 +439,5 @@ module.exports = {
   musicExtFromMime,
   resolveFfmpegPath,
   resolveFfprobePath,
+  runOverlaySelfTest,
 };

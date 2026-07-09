@@ -374,8 +374,53 @@ async function start() {
     // of showing up only as repeated "chat not found" during delivery.
     await verifyNotificationBotAccess();
 
+    // Readiness self-check for the driver-group music overlay (Branch B). Makes
+    // "why is there no music?" answerable from the logs alone.
+    await logMusicOverlayReadiness();
+
     // Start coordinated polling
     coordinator.start();
+}
+
+/**
+ * Log the driver-group music-overlay readiness WITHOUT leaking secrets or signed
+ * URLs: DB pool present? settings readable? driver-group music enabled? active
+ * music present? ffmpeg available? Every branch degrades to the original video,
+ * so this is diagnostics only — it never blocks startup.
+ */
+async function logMusicOverlayReadiness() {
+    const tag = '[SafetyVideo]';
+    try {
+        const hasPool = Boolean(samsaraDb.getPgPool && samsaraDb.getPgPool());
+        console.log(`${tag} Readiness: DATABASE_URL/pool ${hasPool ? 'present' : 'MISSING (overlay disabled)'}.`);
+
+        let ffmpegOk = false;
+        try { ffmpegOk = await driverVideoProcessor.ffmpeg.isAvailable(); } catch (_) { ffmpegOk = false; }
+        console.log(`${tag} Readiness: ffmpeg ${ffmpegOk ? 'available' : 'NOT available — driver videos will be sent WITHOUT music'} `
+            + `(path=${driverVideoProcessor.ffmpeg.ffmpegPath}).`);
+
+        // loadConfig() never throws; it returns { enabled, reason, music, ... }.
+        const cfg = await safetyVideoStore.loadConfig();
+        if (cfg.enabled) {
+            console.log(`${tag} Readiness: driver-group music ENABLED; active music asset id=${cfg.music?.id ?? 'n/a'}`
+                + `${cfg.speedingMusicEnabled === false ? ' (speeding overlay OFF)' : ''}.`);
+            if (!ffmpegOk) {
+                console.warn(`${tag} Readiness: music is configured but ffmpeg is unavailable — install @ffmpeg-installer/ffmpeg `
+                    + 'or set FFMPEG_PATH. Until then the driver group receives the original video.');
+            }
+        } else {
+            const why = {
+                'no-db': 'no database pool',
+                disabled: 'driver_group_music_enabled is FALSE',
+                'no-active-music': 'no active_music_asset_id set',
+                'active-music-missing': 'active music row/bytes missing',
+                error: 'settings read error (table missing or transient)',
+            }[cfg.reason] || cfg.reason || 'unknown';
+            console.log(`${tag} Readiness: driver-group music overlay is OFF — reason: ${why}.`);
+        }
+    } catch (err) {
+        console.warn(`${tag} Readiness self-check skipped: ${err.message}`);
+    }
 }
 
 async function verifyNotificationBotAccess() {
