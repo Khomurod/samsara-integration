@@ -70,3 +70,70 @@ test('runVideoBackfill without a prepareDriverVideo sends original to all (uncha
   assert.equal(res.posted, 1);
   assert.deepEqual(sent, ['ORIG']);
 });
+
+// ── Backfill + telegram-size compression ─────────────────────────────────────
+// The compression lives inside prepareDriverVideoBuffer, so the backfill path
+// gets it automatically when wired with the real processor.
+
+const fs = require('fs');
+const { createDriverVideoProcessor } = require('../src/safetyEventVideoMusicService');
+
+test('runVideoBackfill driver ref receives the COMPRESSED video when the overlay output is oversized', async () => {
+  const prevTarget = process.env.SAFETY_MUSIC_TELEGRAM_MAX_MB;
+  process.env.SAFETY_MUSIC_TELEGRAM_MAX_MB = '0.001'; // ≈1KB target keeps the test tiny
+  try {
+    const sentVideos = [];
+    const makeBot = (kind) => ({
+      async sendVideo(chatId, buffer) { sentVideos.push({ kind, size: buffer.length }); return { message_id: 1 }; },
+      async sendMediaGroup() { return [{ message_id: 1 }]; },
+      async deleteMessage() { return true; },
+    });
+
+    // Overlay writes 5000B (over target) → compression pass writes 500B.
+    let runCalls = 0;
+    const ffmpeg = {
+      isAvailable: async () => true,
+      probe: async () => ({ durationSeconds: 10, hasAudio: true }),
+      run: async (args) => {
+        runCalls += 1;
+        fs.writeFileSync(args[args.length - 1], Buffer.alloc(runCalls === 1 ? 5000 : 500, 0x41));
+      },
+    };
+    const store = {
+      loadConfig: async () => ({
+        enabled: true, speedingMusicEnabled: true, musicVolume: 0.35,
+        preserveOriginalAudio: true, fadeInSeconds: 0, fadeOutSeconds: 0,
+        loopMusicWhenVideoLonger: true, maxVideoSeconds: 120,
+        music: { id: 1, mimeType: 'audio/mp4', durationSeconds: 171, data: Buffer.from('MUSIC') },
+      }),
+      recordJobStart: async () => 1,
+      finishJob: async () => {},
+    };
+    const proc = createDriverVideoProcessor({ store, ffmpeg, log: { log() {}, warn() {}, error() {} } });
+
+    const res = await runVideoBackfill({
+      sentMessages: [
+        { botKind: 'notification', chatId: '-500', messageId: 10, caption: 'n' },
+        { botKind: 'driver', chatId: '-100', messageId: 20, caption: 'd' },
+      ],
+      videoUrls: { forwardUrl: 'https://cdn/f.mp4', inwardUrl: null },
+      resolveBot: (kind) => makeBot(kind === 'driver' ? 'driver' : 'notif'),
+      getVideoBuffer: async () => Buffer.from('ORIG'),
+      caption: 'x',
+      prepareDriverVideo: proc.prepareDriverVideoBuffer,
+      isSpeeding: true,
+      eventId: 'evt-compress',
+      log: { log() {}, warn() {}, error() {} },
+    });
+
+    assert.equal(res.posted, 2);
+    const notif = sentVideos.find((v) => v.kind === 'notif');
+    const driver = sentVideos.find((v) => v.kind === 'driver');
+    assert.equal(notif.size, 4, 'notifications group still gets the ORIGINAL bytes');
+    assert.equal(driver.size, 500, 'driver group gets the compressed overlay output');
+    assert.equal(runCalls, 2, 'overlay + compression pass both ran');
+  } finally {
+    if (prevTarget === undefined) delete process.env.SAFETY_MUSIC_TELEGRAM_MAX_MB;
+    else process.env.SAFETY_MUSIC_TELEGRAM_MAX_MB = prevTarget;
+  }
+});

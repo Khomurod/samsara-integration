@@ -13,7 +13,20 @@
  * problem it returns the original bytes so the driver group still gets the clip.
  * This is BRANCH B only; the notifications-group path (broadcastDelivery's
  * sendNotificationToTarget) does NOT use it and is never affected.
+ *
+ * TELEGRAM SIZE GUARD: bot video uploads over 50 MB are always rejected by
+ * api.telegram.org, so oversized buffers are never uploaded — we skip straight
+ * to the text fallback (with a short note) instead of burning time on a doomed
+ * multi-MB upload. The overlay service already compresses oversized outputs;
+ * this guard is the last line of defence.
  */
+const TELEGRAM_MAX_VIDEO_BYTES = 50 * 1024 * 1024;
+const VIDEO_TOO_LARGE_NOTE = '\n\n⚠️ The dashcam video for this event is too large to deliver via Telegram.';
+
+function isTooLargeForTelegram(buffer) {
+    return Buffer.isBuffer(buffer) && buffer.length > TELEGRAM_MAX_VIDEO_BYTES;
+}
+
 async function sendDriverGroupAlert(driverBot, groupId, {
     caption,
     videoUrl,
@@ -37,6 +50,8 @@ async function sendDriverGroupAlert(driverBot, groupId, {
         }
     };
 
+    let videoTooLarge = false;
+
     if (videoUrl && inwardVideoUrl) {
         try {
             const [forwardBuf, inwardBuf] = await Promise.all([
@@ -46,6 +61,13 @@ async function sendDriverGroupAlert(driverBot, groupId, {
             // Only the forward/road camera gets music; inward stays original to
             // avoid two overlapping music tracks in the same media group.
             const forwardOut = await applyMusic(forwardBuf, 'forward');
+            if (isTooLargeForTelegram(forwardOut) || isTooLargeForTelegram(inwardBuf)) {
+                // Only give up on video entirely when the FORWARD clip is the
+                // oversized one; an oversized inward clip still lets the single
+                // (forward-only) fallback below succeed.
+                videoTooLarge = isTooLargeForTelegram(forwardOut);
+                throw new Error(`video exceeds telegram 50MB limit (forward=${forwardOut.length}B inward=${inwardBuf.length}B) — skipping media-group upload`);
+            }
             const mediaMessages = await driverBot.sendMediaGroup(groupId, [
                 { type: 'video', media: 'attach://forward', caption, parse_mode: 'HTML' },
                 { type: 'video', media: 'attach://inward' },
@@ -60,10 +82,14 @@ async function sendDriverGroupAlert(driverBot, groupId, {
         }
     }
 
-    if (videoUrl) {
+    if (videoUrl && !videoTooLarge) {
         try {
             const buffer = await getVideoBuffer(videoUrl);
             const outBuffer = await applyMusic(buffer, 'single');
+            if (isTooLargeForTelegram(outBuffer)) {
+                videoTooLarge = true;
+                throw new Error(`video exceeds telegram 50MB limit (${outBuffer.length}B) — skipping upload`);
+            }
             const sentVideo = await driverBot.sendVideo(groupId, outBuffer, {
                 caption,
                 parse_mode: 'HTML',
@@ -77,7 +103,8 @@ async function sendDriverGroupAlert(driverBot, groupId, {
         }
     }
 
-    const sentMessage = await driverBot.sendMessage(groupId, caption, {
+    const textBody = videoTooLarge ? `${caption}${VIDEO_TOO_LARGE_NOTE}` : caption;
+    const sentMessage = await driverBot.sendMessage(groupId, textBody, {
         parse_mode: 'HTML',
         disable_web_page_preview: true,
     });
