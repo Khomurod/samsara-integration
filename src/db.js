@@ -303,7 +303,7 @@ module.exports = {
                     telegram_group_id BIGINT NULL,
                     music_asset_id INTEGER NULL,
                     status TEXT NOT NULL DEFAULT 'pending'
-                        CHECK (status IN ('pending','processing','sent','failed','fallback_sent','skipped')),
+                        CHECK (status IN ('pending','processing','sent','compressed_sent','failed','fallback_sent','skipped','failed_too_large')),
                     video_source TEXT NULL
                         CHECK (video_source IS NULL OR video_source IN ('immediate','backfill')),
                     video_reference TEXT NULL,
@@ -315,6 +315,21 @@ module.exports = {
                     started_at TIMESTAMPTZ NULL,
                     finished_at TIMESTAMPTZ NULL
                 )`);
+                // Additive migration for DBs created before the telegram-size
+                // compression statuses existed: widen the status CHECK to allow
+                // 'compressed_sent' and 'failed_too_large'. Drop + re-add is
+                // idempotent per boot and never touches row data.
+                try {
+                    await pgPool.query(`ALTER TABLE safety_event_video_jobs
+                        DROP CONSTRAINT IF EXISTS safety_event_video_jobs_status_check`);
+                    await pgPool.query(`ALTER TABLE safety_event_video_jobs
+                        ADD CONSTRAINT safety_event_video_jobs_status_check
+                        CHECK (status IN ('pending','processing','sent','compressed_sent','failed','fallback_sent','skipped','failed_too_large'))`);
+                } catch (constraintErr) {
+                    // Best-effort: finishJob writes are already best-effort, so a
+                    // failed widen only means new statuses fall back to warnings.
+                    console.warn('[DB] Could not widen safety_event_video_jobs status constraint:', constraintErr.message);
+                }
                 console.log('[DB] PostgreSQL deduplication + delivery-ledger tables ready.');
             } catch (err) {
                 console.error('[DB] Failed to init pg table:', err.message);

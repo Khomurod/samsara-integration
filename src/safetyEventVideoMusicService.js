@@ -15,6 +15,14 @@
  *         with a silent tail.
  *   • Original video stream is COPIED (-c:v copy): dimensions/quality preserved,
  *     fast, low CPU, negligible size change. Only audio is (re)encoded to AAC.
+ *   • TELEGRAM SIZE GUARD: bot uploads via api.telegram.org are capped at 50 MB.
+ *     When the overlaid output exceeds the safe target (default 49 MB, override
+ *     with SAFETY_MUSIC_TELEGRAM_MAX_MB) it is automatically re-encoded with
+ *     libx264 (music track preserved) — first a 720p pass sized to the target,
+ *     then a more aggressive 480p pass. If compression cannot produce a
+ *     sendable file the ORIGINAL buffer is returned (and when even that is over
+ *     the hard 50 MB limit the job is recorded as failed_too_large so the
+ *     delivery layer can skip the doomed upload and fall back to text).
  *   • ffmpeg is resolved from FFMPEG_PATH → optional ffmpeg-static package → PATH.
  *
  * ffmpeg is invoked via child_process; the invocation layer is injectable so the
@@ -29,6 +37,23 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 
 const FFMPEG_TIMEOUT_MS = parseInt(process.env.SAFETY_MUSIC_FFMPEG_TIMEOUT_MS || '60000', 10);
+
+// Telegram rejects bot uploads over 50 MB (api.telegram.org). We aim below a
+// safe target so container overhead / bitrate variance never tips us over.
+const TELEGRAM_HARD_LIMIT_BYTES = 50 * 1024 * 1024;
+
+/** Safe target size in bytes (default 49 MB; SAFETY_MUSIC_TELEGRAM_MAX_MB overrides, capped below the hard limit). */
+function resolveTelegramTargetBytes(env = process.env) {
+  const mb = Number(env.SAFETY_MUSIC_TELEGRAM_MAX_MB);
+  const safeMb = Number.isFinite(mb) && mb > 0 ? Math.min(mb, 49.5) : 49;
+  return Math.floor(safeMb * 1024 * 1024);
+}
+
+/** Compression runs re-encode video, so they get a longer timeout than overlay. */
+function resolveCompressTimeoutMs(env = process.env) {
+  const n = parseInt(env.SAFETY_MUSIC_COMPRESS_TIMEOUT_MS || '90000', 10);
+  return Number.isFinite(n) && n > 0 ? n : 90000;
+}
 
 function resolveBinary(envVar, staticPkgs, fallback) {
   const fromEnv = String(process.env[envVar] || '').trim();
@@ -124,6 +149,53 @@ function buildFfmpegArgs({
   return args;
 }
 
+/**
+ * Size-targeted compression plan for an oversized overlay output. Pure +
+ * deterministic (unit-tested). Pass 1 keeps 720p with a bitrate computed from
+ * the target size; pass 2 drops to 480p with a harder safety margin.
+ * @returns {{videoKbps:number, audioKbps:number, maxHeight:number, preset:string, pass:number}}
+ */
+function computeCompressionPlan({ durationSeconds, targetBytes, pass = 1 }) {
+  const dur = Math.max(1, Number(durationSeconds) || 60);
+  const target = Math.max(1, Number(targetBytes) || TELEGRAM_HARD_LIMIT_BYTES);
+  const audioKbps = pass === 1 ? 128 : 96;
+  // Margin absorbs mp4 container overhead + encoder bitrate variance.
+  const margin = pass === 1 ? 0.92 : 0.8;
+  const totalKbps = (target * 8 * margin) / 1000 / dur;
+  const videoKbps = Math.max(250, Math.floor(totalKbps - audioKbps));
+  return {
+    videoKbps,
+    audioKbps,
+    maxHeight: pass === 1 ? 720 : 480,
+    preset: pass === 1 ? 'veryfast' : 'faster',
+    pass,
+  };
+}
+
+/**
+ * ffmpeg argument vector for a compression pass. Re-encodes video with libx264
+ * capped to the plan's bitrate; audio (the music track) is re-encoded AAC so it
+ * is always preserved. Output duration stays bounded to the source video.
+ */
+function buildCompressionArgs({ inPath, outPath, plan, durationSeconds }) {
+  const args = [
+    '-y', '-hide_banner', '-loglevel', 'error',
+    '-i', inPath,
+    // Downscale only (never upscale): min(maxHeight, ih); -2 keeps width even.
+    '-vf', `scale=-2:min(${plan.maxHeight}\\,ih)`,
+    '-c:v', 'libx264', '-preset', plan.preset,
+    '-b:v', `${plan.videoKbps}k`,
+    '-maxrate', `${Math.floor(plan.videoKbps * 1.4)}k`,
+    '-bufsize', `${plan.videoKbps * 2}k`,
+    '-c:a', 'aac', '-b:a', `${plan.audioKbps}k`,
+    '-movflags', '+faststart',
+  ];
+  const dur = Number(durationSeconds);
+  if (Number.isFinite(dur) && dur > 0) args.push('-t', String(round3(dur)));
+  args.push(outPath);
+  return args;
+}
+
 /** Parse an ffmpeg/ffprobe "Duration: HH:MM:SS.xx" line. */
 function parseDurationFromStderr(text) {
   const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(String(text || ''));
@@ -144,7 +216,7 @@ function makeFfmpeg({
 } = {}) {
   let availabilityCache;
 
-  function runProcess(bin, args) {
+  function runProcess(bin, args, { timeoutMs: runTimeoutMs = timeoutMs } = {}) {
     return new Promise((resolve, reject) => {
       let stdout = '';
       let stderr = '';
@@ -157,8 +229,8 @@ function makeFfmpeg({
       }
       const timer = setTimeout(() => {
         try { child.kill('SIGKILL'); } catch (_) { /* ignore */ }
-        reject(new Error(`${path.basename(String(bin))} timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
+        reject(new Error(`${path.basename(String(bin))} timed out after ${runTimeoutMs}ms`));
+      }, runTimeoutMs);
       child.stdout?.on('data', (d) => { stdout += d.toString(); });
       child.stderr?.on('data', (d) => { stderr += d.toString(); });
       child.on('error', (err) => { clearTimeout(timer); reject(err); });
@@ -208,8 +280,8 @@ function makeFfmpeg({
     }
   }
 
-  async function run(args) {
-    return runProcess(ffmpegPath, args);
+  async function run(args, opts) {
+    return runProcess(ffmpegPath, args, opts);
   }
 
   return { isAvailable, probe, run, ffmpegPath, ffprobePath };
@@ -345,13 +417,75 @@ function createDriverVideoProcessor({ store, ffmpeg = makeFfmpeg(), tmpDir, log 
       const outBuf = fs.readFileSync(outPath);
       if (!outBuf || outBuf.length === 0) throw new Error('ffmpeg produced an empty file');
 
+      const mb = (n) => (n / (1024 * 1024)).toFixed(1);
+      const targetBytes = resolveTelegramTargetBytes();
+
+      // Fast path (unchanged behaviour): output fits Telegram — send as-is.
+      if (outBuf.length <= targetBytes) {
+        await store.finishJob(jobId, {
+          status: 'sent',
+          videoDurationSeconds: videoDuration,
+          musicTrimMode: plan.mode,
+        });
+        log.log?.(`[SafetyVideo] overlay ok: ${(outBuf.length / 1024).toFixed(0)}KB (was ${(buffer.length / 1024).toFixed(0)}KB) event=${eventId || 'n/a'}`);
+        return outBuf;
+      }
+
+      // Oversized for Telegram → compression passes (music track preserved).
+      log.log?.(`[SafetyVideo] overlay output ${mb(outBuf.length)}MB exceeds telegram target ${mb(targetBytes)}MB — compressing. event=${eventId || 'n/a'}`);
+      let compressErr = null;
+      for (const pass of [1, 2]) {
+        try {
+          const cPlan = computeCompressionPlan({ durationSeconds: videoDuration, targetBytes, pass });
+          const cPath = path.join(workDir, `compressed-p${pass}.mp4`);
+          await ffmpeg.run(
+            buildCompressionArgs({ inPath: outPath, outPath: cPath, plan: cPlan, durationSeconds: videoDuration }),
+            { timeoutMs: resolveCompressTimeoutMs() },
+          );
+          const cBuf = fs.readFileSync(cPath);
+          // Pass 1 must hit the safe target; pass 2 may land anywhere under the hard limit.
+          const acceptable = cBuf.length > 0
+            && (cBuf.length <= targetBytes || (pass === 2 && cBuf.length <= TELEGRAM_HARD_LIMIT_BYTES));
+          if (acceptable) {
+            await store.finishJob(jobId, {
+              status: 'compressed_sent',
+              videoDurationSeconds: videoDuration,
+              musicTrimMode: plan.mode,
+            });
+            log.log?.(`[SafetyVideo] compressed ok (pass ${pass}, ${cPlan.maxHeight}p @${cPlan.videoKbps}k): `
+              + `original=${mb(buffer.length)}MB overlay=${mb(outBuf.length)}MB compressed=${mb(cBuf.length)}MB event=${eventId || 'n/a'}`);
+            return cBuf;
+          }
+          log.warn?.(`[SafetyVideo] compression pass ${pass} still oversized (${mb(cBuf.length)}MB) event=${eventId || 'n/a'}`);
+        } catch (err) {
+          compressErr = err;
+          log.warn?.(`[SafetyVideo] compression pass ${pass} failed: ${err.message} event=${eventId || 'n/a'}`);
+        }
+      }
+
+      // Compression could not produce a sendable file. Never lose the driver
+      // video: return the ORIGINAL when it is itself sendable; otherwise flag
+      // the job so the delivery layer can skip the doomed upload.
+      const reason = compressErr
+        ? `compression failed: ${String(compressErr.message).slice(0, 300)}`
+        : 'compressed output still exceeds telegram limit';
+      if (buffer.length <= TELEGRAM_HARD_LIMIT_BYTES) {
+        await store.finishJob(jobId, {
+          status: 'fallback_sent',
+          errorMessage: reason,
+          videoDurationSeconds: videoDuration,
+        });
+        log.warn?.(`[SafetyVideo] ${reason} — sending ORIGINAL (${mb(buffer.length)}MB) without music. event=${eventId || 'n/a'}`);
+        return buffer;
+      }
       await store.finishJob(jobId, {
-        status: 'sent',
+        status: 'failed_too_large',
+        errorMessage: `${reason}; original ${mb(buffer.length)}MB also exceeds telegram limit`,
         videoDurationSeconds: videoDuration,
-        musicTrimMode: plan.mode,
       });
-      log.log?.(`[SafetyVideo] overlay ok: ${(outBuf.length / 1024).toFixed(0)}KB (was ${(buffer.length / 1024).toFixed(0)}KB) event=${eventId || 'n/a'}`);
-      return outBuf;
+      log.error?.(`[SafetyVideo] video too large for telegram even after compression `
+        + `(original=${mb(buffer.length)}MB overlay=${mb(outBuf.length)}MB) event=${eventId || 'n/a'}`);
+      return buffer;
     } catch (err) {
       log.error?.(`[SafetyVideo] overlay failed (${err.message}); sending original video. event=${eventId || 'n/a'}`);
       if (jobId) {
@@ -435,9 +569,13 @@ module.exports = {
   makeFfmpeg,
   chooseMusicPlan,
   buildFfmpegArgs,
+  computeCompressionPlan,
+  buildCompressionArgs,
   parseDurationFromStderr,
   musicExtFromMime,
   resolveFfmpegPath,
   resolveFfprobePath,
+  resolveTelegramTargetBytes,
   runOverlaySelfTest,
+  TELEGRAM_HARD_LIMIT_BYTES,
 };

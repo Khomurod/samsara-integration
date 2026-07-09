@@ -113,3 +113,68 @@ test('deliverEvent does NOT overlay when the event is not a speeding event', asy
   assert.deepEqual(received.driver, ['ORIG']);
   assert.deepEqual(received.notif, ['ORIG']);
 });
+
+// ── Telegram 50MB size guard (driver-group path) ─────────────────────────────
+
+test('sendDriverGroupAlert never uploads a >50MB video — sends text with a clear note instead', async () => {
+  const huge = Buffer.alloc(50 * 1024 * 1024 + 1, 0x42);
+  const calls = { sendVideo: 0, sendMessage: 0, texts: [] };
+  const bot = {
+    async sendVideo() { calls.sendVideo += 1; return { message_id: 1 }; },
+    async sendMediaGroup() { throw new Error('should not be called'); },
+    async sendMessage(_chat, text) { calls.sendMessage += 1; calls.texts.push(text); return { message_id: 9 }; },
+  };
+  const res = await sendDriverGroupAlert(bot, '-100', {
+    caption: 'Speeding alert',
+    videoUrl: 'https://cdn/f.mp4',
+    getVideoBuffer: async () => huge,
+    log: { log() {}, warn() {}, error() {} },
+  });
+  assert.equal(calls.sendVideo, 0, 'oversized upload was skipped entirely');
+  assert.equal(calls.sendMessage, 1);
+  assert.equal(res.type, 'text');
+  assert.match(calls.texts[0], /too large/i, 'text fallback explains the video was too large');
+});
+
+test('sendDriverGroupAlert dual-camera: oversized INWARD clip still lets the forward-only video send', async () => {
+  const small = Buffer.alloc(1000, 0x41);
+  const huge = Buffer.alloc(50 * 1024 * 1024 + 1, 0x42);
+  const calls = { mediaGroup: 0, sendVideo: 0, sendMessage: 0 };
+  const bot = {
+    async sendMediaGroup() { calls.mediaGroup += 1; return [{ message_id: 1 }]; },
+    async sendVideo() { calls.sendVideo += 1; return { message_id: 2 }; },
+    async sendMessage() { calls.sendMessage += 1; return { message_id: 3 }; },
+  };
+  const res = await sendDriverGroupAlert(bot, '-100', {
+    caption: 'Speeding alert',
+    videoUrl: 'https://cdn/f.mp4',
+    inwardVideoUrl: 'https://cdn/i.mp4',
+    getVideoBuffer: async (url) => (url.includes('/i.mp4') ? huge : small),
+    log: { log() {}, warn() {}, error() {} },
+  });
+  assert.equal(calls.mediaGroup, 0, 'media group with an oversized member is not attempted');
+  assert.equal(calls.sendVideo, 1, 'forward-only video still sent');
+  assert.equal(res.type, 'caption');
+});
+
+test('sendDriverGroupAlert dual-camera: oversized FORWARD clip skips all uploads and falls to text', async () => {
+  const small = Buffer.alloc(1000, 0x41);
+  const huge = Buffer.alloc(50 * 1024 * 1024 + 1, 0x42);
+  const calls = { mediaGroup: 0, sendVideo: 0, sendMessage: 0, texts: [] };
+  const bot = {
+    async sendMediaGroup() { calls.mediaGroup += 1; return [{ message_id: 1 }]; },
+    async sendVideo() { calls.sendVideo += 1; return { message_id: 2 }; },
+    async sendMessage(_c, text) { calls.sendMessage += 1; calls.texts.push(text); return { message_id: 3 }; },
+  };
+  const res = await sendDriverGroupAlert(bot, '-100', {
+    caption: 'Speeding alert',
+    videoUrl: 'https://cdn/f.mp4',
+    inwardVideoUrl: 'https://cdn/i.mp4',
+    getVideoBuffer: async (url) => (url.includes('/f.mp4') ? huge : small),
+    log: { log() {}, warn() {}, error() {} },
+  });
+  assert.equal(calls.mediaGroup, 0);
+  assert.equal(calls.sendVideo, 0, 'single-video path also skipped — same oversized forward clip');
+  assert.equal(res.type, 'text');
+  assert.match(calls.texts[0], /too large/i);
+});
