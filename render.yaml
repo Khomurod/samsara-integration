@@ -16,6 +16,10 @@ services:
     name: samsara-poller
     env: node
     plan: free
+    # `npm install` also provisions the driver-group music overlay's ffmpeg via
+    # the @ffmpeg-installer/ffmpeg + @ffprobe-installer/ffprobe dependencies
+    # (registry binaries, no external download). No apt step or FFMPEG_PATH is
+    # required; set FFMPEG_PATH/FFPROBE_PATH only to override with a custom build.
     buildCommand: npm install
     startCommand: node index.js
     healthCheckPath: /health
