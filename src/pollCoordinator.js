@@ -54,5 +54,7 @@ function stop() {
 
 module.exports = {
   start,
-  stop
+  stop,
+  /** @returns {boolean} whether the coordinated polling cycle is active. Read-only. */
+  isRunning: () => isRunning,
 };

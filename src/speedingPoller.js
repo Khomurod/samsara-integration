@@ -48,6 +48,12 @@ let isProcessingQueue = false;
 let broadcastFn = null;
 let droppedAlertsCount = 0;
 
+// ── Observability only (read by the /health endpoint) ──────────────────────
+// These NEVER influence polling, delivery, dedup, or DB behaviour.
+let lastSuccessfulPollAt = null; // ms epoch of the last successful stream poll
+let lastPollEndTime = null;      // ISO endTime of the last successful stream poll
+let lastApiError = null;         // { code, message, at } — sanitized before it leaves /health
+
 const SEEN_IDS = new Set();
 const PENDING_DELIVERY_IDS = new Set();
 const MAX_SEEN_IDS = 1000;
@@ -534,11 +540,17 @@ async function executePoll() {
 
     await savePollState(WATERMARK_KEY, endTime);
 
+    // Observability: the stream poll completed its page scan successfully.
+    // Recorded for /health staleness detection.
+    lastSuccessfulPollAt = Date.now();
+    lastPollEndTime = endTime;
+
     if (totalQueued > 0) {
       console.log(`[SpeedPoller] Picked up ${totalQueued} new speeding event(s).`);
     }
   } catch (err) {
     console.error('[SpeedPoller] Fetch error:', err.message);
+    lastApiError = { code: 'STREAM_ERROR', message: String(err.message).slice(0, 500), at: new Date().toISOString() };
   } finally {
     executePoll.isRunning = false;
   }
@@ -550,6 +562,21 @@ module.exports = {
   },
 
   executePoll,
+
+  /**
+   * Read-only operational snapshot for the /health endpoint. Contains no
+   * secrets and never mutates poller state.
+   */
+  getStatus() {
+    return {
+      enabled: SPEEDING_ENABLED,
+      lastSuccessAt: lastSuccessfulPollAt,
+      lastPollEndTime,
+      lastApiError,
+      queueSize: ALERT_QUEUE.length,
+      droppedAlerts: droppedAlertsCount,
+    };
+  },
 
   start(intervalMs = 15000) {
     if (!SPEEDING_ENABLED) {

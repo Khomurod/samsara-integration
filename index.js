@@ -25,6 +25,14 @@ const { createDeliveryTracker, classifyTelegramError } = require('./src/delivery
 const { scheduleVideoBackfill } = require('./src/videoBackfill');
 const { createSafetyEventVideoStore } = require('./src/safetyEventVideoSettings');
 const { createDriverVideoProcessor } = require('./src/safetyEventVideoMusicService');
+const { buildHealthReport } = require('./src/healthReport');
+
+// /health tuning. A poll that has not succeeded within the stale threshold marks
+// the service unhealthy (503) so an uptime monitor / Render health check can spot
+// a dead poll coordinator even while the Express server still answers.
+const HEALTH_STALE_THRESHOLD_MS = parseInt(process.env.HEALTH_STALE_THRESHOLD_MS || '300000', 10); // 5 min
+const HEALTH_STARTUP_GRACE_MS = parseInt(process.env.HEALTH_STARTUP_GRACE_MS || '120000', 10); // 2 min
+const SPEEDING_ENABLED = process.env.SAMSARA_SPEEDING_ENABLED !== 'false';
 
 // Durable per-(event, target) delivery ledger — the source of truth for
 // "already sent, do not send again".
@@ -77,11 +85,31 @@ app.use(express.json());
 let httpServer = null;
 
 app.get('/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        uptime: process.uptime(),
-        timestamp: new Date().toISOString(),
-    });
+    // Lightweight, in-memory only (no DB / network) so an uptime monitor can call
+    // it every few minutes safely. Reports real poll liveness, not just that
+    // Express is up, and returns 503 when polling has gone stale/stopped.
+    try {
+        const report = buildHealthReport({
+            now: Date.now(),
+            uptimeSeconds: process.uptime(),
+            coordinatorRunning: typeof coordinator.isRunning === 'function' ? coordinator.isRunning() : false,
+            staleThresholdMs: HEALTH_STALE_THRESHOLD_MS,
+            startupGraceMs: HEALTH_STARTUP_GRACE_MS,
+            safety: typeof poller.getStatus === 'function' ? poller.getStatus() : {},
+            speeding: typeof speedingPoller.getStatus === 'function'
+                ? speedingPoller.getStatus()
+                : { enabled: SPEEDING_ENABLED },
+        });
+        res.status(report.statusCode).json(report.body);
+    } catch (err) {
+        // /health must never throw; fall back to the legacy minimal shape.
+        res.status(200).json({
+            status: 'ok',
+            uptime: Math.round(process.uptime()),
+            timestamp: new Date().toISOString(),
+            healthDetailError: err.message,
+        });
+    }
 });
 
 // Plain root — some uptime pingers hit "/". Keep it tiny, auth-free, and 200.
