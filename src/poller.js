@@ -38,6 +38,12 @@ let isProcessingQueue = false;
 let broadcastFn = null;
 let droppedAlertsCount = 0;
 
+// ── Observability only (read by the /health endpoint) ──────────────────────
+// These NEVER influence polling, delivery, dedup, or DB behaviour.
+let lastSuccessfulPollAt = null; // ms epoch of the last HTTP 2xx poll
+let lastPollEndTime = null;      // ISO endTime of the last HTTP 2xx poll
+let lastApiError = null;         // { code, message, at } — sanitized before it leaves /health
+
 // Keep track of recently seen event IDs to prevent duplicates if the cursor
 // hasn't updated yet or if we fall back to time-based polling.
 const SEEN_IDS = new Set();
@@ -297,6 +303,7 @@ async function executePoll() {
         if (!response.ok) {
             const body = await response.text();
             console.error(`[Poller] HTTP ${response.status}: ${body}`);
+            lastApiError = { code: response.status, message: String(body).slice(0, 500), at: new Date().toISOString() };
             if (response.status === 400 && body.includes(`invalid pagination 'after' parameter`)) {
                 console.warn('[Poller] Clearing invalid cursor so next poll uses time window only.');
                 clearCursor();
@@ -352,8 +359,14 @@ async function executePoll() {
             await savePollWatermark(endTime);
         }
 
+        // Observability: this poll reached the API successfully (2xx), even if
+        // it returned zero events. Recorded for /health staleness detection.
+        lastSuccessfulPollAt = Date.now();
+        lastPollEndTime = endTime;
+
     } catch (err) {
         console.error('[Poller] Fetch error:', err.message);
+        lastApiError = { code: 'FETCH_ERROR', message: String(err.message).slice(0, 500), at: new Date().toISOString() };
     } finally {
         executePoll.isRunning = false;
     }
@@ -408,6 +421,20 @@ module.exports = {
     },
 
     executePoll,
+
+    /**
+     * Read-only operational snapshot for the /health endpoint. Contains no
+     * secrets and never mutates poller state.
+     */
+    getStatus() {
+        return {
+            lastSuccessAt: lastSuccessfulPollAt,
+            lastPollEndTime,
+            lastApiError,
+            queueSize: ALERT_QUEUE.length,
+            droppedAlerts: droppedAlertsCount,
+        };
+    },
 
     _forTest: {
         enqueueAlertForTest,
