@@ -77,6 +77,7 @@ function envInitialDelayMs() {
 }
 
 function intOr(value, fallback) {
+  if (value === null || value === undefined) return fallback;
   const n = Number.parseInt(value, 10);
   return Number.isFinite(n) ? n : fallback;
 }
@@ -124,6 +125,17 @@ function createSamsaraSettingsStore({ pool, log = console } = {}) {
     cacheExpiresAt = 0;
   }
 
+  /** NULL is "not saved in the panel" and inherits; only a real boolean overrides. */
+  function bool(value, fallback) {
+    return typeof value === 'boolean' ? value : fallback;
+  }
+
+  /**
+   * NULL IS MEANINGFUL IN EVERY OPERATIONAL COLUMN: "nothing saved — inherit
+   * the environment variable this service has always read". That is what lets
+   * the settings row exist from the moment the migration runs without changing
+   * a single thing about a running deployment.
+   */
   function mapRow(row) {
     const env = envConfig();
     const storedKey = row.api_key_encrypted ? safeDecryptShared(row.api_key_encrypted) : '';
@@ -145,13 +157,13 @@ function createSamsaraSettingsStore({ pool, log = console } = {}) {
       apiKey: storedKey || env.apiKey,
       apiKeySource: storedKey ? 'database' : env.apiKeySource,
       apiBase: (row.api_base || env.apiBase).replace(/\/+$/, ''),
-      speedingEventsEnabled: row.speeding_events_enabled !== false,
+      speedingEventsEnabled: bool(row.speeding_events_enabled, env.speedingEventsEnabled),
       maxVideoMegabytes: intOr(row.max_video_megabytes, env.maxVideoMegabytes),
-      videoRecoveryEnabled: row.video_recovery_enabled !== false,
+      videoRecoveryEnabled: bool(row.video_recovery_enabled, env.videoRecoveryEnabled),
       videoRecoveryInitialDelaySeconds: intOr(
         row.video_recovery_initial_delay_seconds, env.videoRecoveryInitialDelaySeconds
       ),
-      videoRetrievalEnabled: row.video_retrieval_enabled !== false,
+      videoRetrievalEnabled: bool(row.video_retrieval_enabled, env.videoRetrievalEnabled),
       videoRecoveryRetryIntervalSeconds: intOr(
         row.video_recovery_retry_interval_seconds, env.videoRecoveryRetryIntervalSeconds
       ),

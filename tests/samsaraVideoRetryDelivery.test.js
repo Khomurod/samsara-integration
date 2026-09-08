@@ -66,13 +66,19 @@ test('enqueueFormattedAlert carries an explicit delay into the backfill descript
   assert.equal(alert.videoBackfill.delayMs, 1234);
 });
 
-test('enqueueFormattedAlert attaches no backfill when retry disabled', () => {
+test('the environment alone no longer decides whether a recovery happens', () => {
+  // The descriptor is attached whenever a clip is missing. Whether a recovery
+  // is CREATED is decided by enqueueVideoRecovery against the settings row —
+  // see samsaraVideoRecovery.test.js. Deciding it here would mean deciding it
+  // from the environment alone, which let a deployment carrying
+  // SAMSARA_VIDEO_RETRY_ENABLED=false silently defeat an administrator who had
+  // just switched recovery on in the panel.
   process.env.SAMSARA_VIDEO_RETRY_ENABLED = 'false';
   let queued = 0;
   const alert = { text: 'x' };
   enqueueFormattedAlert(alert, { id: 'evt-off' }, () => { queued += 1; });
-  assert.equal(queued, 1);
-  assert.equal(alert.videoBackfill, undefined);
+  assert.equal(queued, 1, 'the alert still goes out immediately, as always');
+  assert.ok(alert.videoBackfill, 'and the settings get the final say, not this');
   delete process.env.SAMSARA_VIDEO_RETRY_ENABLED;
 });
 

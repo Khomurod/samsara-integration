@@ -28,11 +28,11 @@ async function refreshRuntimeConfig() {
     const cfg = await loadSamsaraConfig();
     if (cfg.apiKey) SAMSARA_API_KEY = cfg.apiKey;
     if (cfg.apiBase) SAMSARA_API_BASE = cfg.apiBase;
-    // The env var stays a veto: a deployment that turned speeding off there
-    // must not be silently re-enabled by a database default.
-    SPEEDING_ENABLED = process.env.SAMSARA_SPEEDING_ENABLED !== 'false'
-      && cfg.speedingEventsEnabled !== false
-      && cfg.enabled !== false;
+    // The settings row decides, and it already falls back to
+    // SAMSARA_SPEEDING_ENABLED when nothing is saved. ANDing the env in as
+    // well would let a deployment silently defeat an administrator who had
+    // just switched speeding back on in the panel.
+    SPEEDING_ENABLED = cfg.speedingEventsEnabled !== false && cfg.enabled !== false;
     return cfg;
   } catch (err) {
     console.warn('[SpeedPoller] Could not refresh Samsara settings:', err.message);

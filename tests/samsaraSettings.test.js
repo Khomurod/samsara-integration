@@ -135,3 +135,63 @@ test('the describe() line carries no secret', async () => {
     assert.match(line, /key=environment/);
   });
 });
+
+test('the seeded row changes nothing about a running deployment', async () => {
+  // The row is created by the migration with every operational column NULL. If
+  // those columns carried SQL defaults instead, a deployment's own
+  // SAMSARA_MAX_VIDEO_BYTES or SAMSARA_VIDEO_RETRY_DELAY_MS would be silently
+  // overwritten the moment the migration ran, before anyone opened the panel.
+  await withEnv({
+    SAMSARA_API_KEY: 'env-key',
+    SAMSARA_MAX_VIDEO_BYTES: String(50 * 1024 * 1024),
+    SAMSARA_VIDEO_RETRY_DELAY_MS: '90000',
+    SAMSARA_VIDEO_RETRY_ENABLED: 'false',
+    SAMSARA_SPEEDING_ENABLED: 'false',
+  }, async () => {
+    const seeded = {
+      id: 1,
+      enabled: true,
+      api_key_encrypted: null,
+      api_base: null,
+      speeding_events_enabled: null,
+      max_video_megabytes: null,
+      video_recovery_enabled: null,
+      video_recovery_initial_delay_seconds: null,
+      video_retrieval_enabled: null,
+      video_recovery_retry_interval_seconds: null,
+      video_recovery_max_attempts: null,
+      video_retrieval_window_before_seconds: null,
+      video_retrieval_window_after_seconds: null,
+    };
+    const store = createSamsaraSettingsStore({ pool: poolReturning(seeded), log: silentLog });
+    const cfg = await store.load();
+
+    assert.equal(cfg.apiKey, 'env-key');
+    assert.equal(cfg.maxVideoMegabytes, 50, 'the deployed size cap survives the migration');
+    assert.equal(cfg.videoRecoveryInitialDelaySeconds, 90, 'and the deployed delay');
+    assert.equal(cfg.videoRecoveryEnabled, false, 'and a deployment that turned recovery off stays off');
+    assert.equal(cfg.speedingEventsEnabled, false);
+
+    // The columns with no environment counterpart still get the shipped defaults.
+    assert.equal(cfg.videoRecoveryMaxAttempts, DEFAULTS.videoRecoveryMaxAttempts);
+    assert.equal(cfg.videoRetrievalWindowAfterSeconds, DEFAULTS.videoRetrievalWindowAfterSeconds);
+  });
+});
+
+test('a saved value does override the environment — that is the point', async () => {
+  await withEnv({
+    SAMSARA_API_KEY: 'env-key',
+    SAMSARA_MAX_VIDEO_BYTES: String(50 * 1024 * 1024),
+    SAMSARA_VIDEO_RETRY_ENABLED: 'false',
+  }, async () => {
+    const store = createSamsaraSettingsStore({
+      pool: poolReturning({
+        id: 1, enabled: true, max_video_megabytes: 30, video_recovery_enabled: true,
+      }),
+      log: silentLog,
+    });
+    const cfg = await store.load();
+    assert.equal(cfg.maxVideoMegabytes, 30);
+    assert.equal(cfg.videoRecoveryEnabled, true, 'FALSE in the environment is not a veto on THIS reader');
+  });
+});

@@ -23,10 +23,15 @@ const {
 } = require('./samsaraSettings');
 
 /**
- * The environment's veto on recovery. The real setting lives in the admin
- * panel (`samsara_settings`); this stays a hard "off" for a deployment that
- * chose one, and it is read synchronously because the decision happens while
- * the alert is being formatted.
+ * Whether the ENVIRONMENT alone would enable recovery.
+ *
+ * It is NOT consulted on the alert path any more, and deliberately so: it used
+ * to veto, which meant a deployment carrying SAMSARA_VIDEO_RETRY_ENABLED=false
+ * could silently defeat an administrator who had just switched recovery ON in
+ * the panel — the same silent-override shape the nullable settings columns
+ * exist to prevent. The single decision point is now
+ * `cfg.videoRecoveryEnabled`, which already falls back to this value when
+ * nothing is saved. Exported for the settings reader and its tests.
  */
 const isVideoRetryEnabled = isVideoRecoveryEnabledInEnv;
 
@@ -52,8 +57,12 @@ function enqueueFormattedAlert(formattedAlert, rawEvent, queueAlert, options = {
     formattedAlert.samsaraEventId = eventId;
   }
 
+  // The descriptor is attached whenever a clip is missing; whether a recovery
+  // is actually created is decided by `enqueueVideoRecovery`, which can await
+  // the settings. Deciding it here would mean deciding it from the environment
+  // alone, because this runs while the alert is being formatted.
   const hasVideo = Boolean(formattedAlert.videoUrl || formattedAlert.inwardVideoUrl);
-  if (!hasVideo && eventId && isVideoRetryEnabled()) {
+  if (!hasVideo && eventId) {
     formattedAlert.videoBackfill = {
       eventId,
       rawEvent,
