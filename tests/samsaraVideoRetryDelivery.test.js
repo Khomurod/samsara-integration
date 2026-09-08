@@ -4,11 +4,9 @@ const assert = require('node:assert/strict');
 const {
   isVideoRetryEnabled,
   getVideoRetryDelayMs,
-  patchAlertVideoUrls,
   enqueueFormattedAlert,
-  inferVideoRetrievalParams,
-  pollRetrievedVideoUrls,
   DEFAULT_DELAY_MS,
+  MIN_DELAY_MS,
 } = require('../src/videoRetryDelivery');
 
 const origRetryEnabled = process.env.SAMSARA_VIDEO_RETRY_ENABLED;
@@ -21,24 +19,20 @@ test.after(() => {
   else process.env.SAMSARA_VIDEO_RETRY_DELAY_MS = origRetryDelay;
 });
 
-test('getVideoRetryDelayMs defaults and clamps', () => {
+test('getVideoRetryDelayMs defaults to five minutes and no longer caps a long wait', () => {
   delete process.env.SAMSARA_VIDEO_RETRY_DELAY_MS;
   assert.equal(getVideoRetryDelayMs(), DEFAULT_DELAY_MS);
-  process.env.SAMSARA_VIDEO_RETRY_DELAY_MS = '10000';
-  assert.equal(getVideoRetryDelayMs(), 30_000);
-  process.env.SAMSARA_VIDEO_RETRY_DELAY_MS = '999999';
-  assert.equal(getVideoRetryDelayMs(), 180_000);
-  delete process.env.SAMSARA_VIDEO_RETRY_DELAY_MS;
-});
+  assert.equal(DEFAULT_DELAY_MS, 300_000, 'the shipped default is the 5 minutes the admin panel shows');
 
-test('patchAlertVideoUrls sets forward and inward URLs', () => {
-  const alert = { text: 'x' };
-  patchAlertVideoUrls(alert, {
-    forwardUrl: 'https://forward.mp4',
-    inwardUrl: 'https://inward.mp4',
-  });
-  assert.equal(alert.videoUrl, 'https://forward.mp4');
-  assert.equal(alert.inwardVideoUrl, 'https://inward.mp4');
+  // The old ceiling was three minutes, so the operator's chosen delay could
+  // never actually be honoured — an admin-set 5 minutes silently became 3.
+  process.env.SAMSARA_VIDEO_RETRY_DELAY_MS = '600000';
+  assert.equal(getVideoRetryDelayMs(), 600_000, 'a ten-minute wait is honoured, not clamped');
+
+  // A floor survives, purely so a mis-set value cannot become a tight loop.
+  process.env.SAMSARA_VIDEO_RETRY_DELAY_MS = '100';
+  assert.equal(getVideoRetryDelayMs(), MIN_DELAY_MS);
+  delete process.env.SAMSARA_VIDEO_RETRY_DELAY_MS;
 });
 
 test('enqueueFormattedAlert queues immediately when video present (no backfill)', () => {
@@ -65,24 +59,26 @@ test('enqueueFormattedAlert queues immediately and attaches backfill when video 
   assert.equal(alert.videoBackfill.rawEvent, rawEvent);
 });
 
-test('enqueueFormattedAlert carries custom refetch/retrieval fns into backfill descriptor', () => {
+test('enqueueFormattedAlert carries an explicit delay into the backfill descriptor', () => {
   delete process.env.SAMSARA_VIDEO_RETRY_ENABLED;
   const alert = { text: 'x' };
-  const refetchFn = async () => ({ forwardUrl: null, inwardUrl: null });
-  const retrievalFn = async () => ({ forwardUrl: 'https://gen.mp4', inwardUrl: null });
-  enqueueFormattedAlert(alert, { id: 'evt-speed' }, () => {}, { refetchFn, retrievalFn, delayMs: 1234 });
-  assert.equal(alert.videoBackfill.refetchFn, refetchFn);
-  assert.equal(alert.videoBackfill.retrievalFn, retrievalFn);
+  enqueueFormattedAlert(alert, { id: 'evt-speed' }, () => {}, { delayMs: 1234 });
   assert.equal(alert.videoBackfill.delayMs, 1234);
 });
 
-test('enqueueFormattedAlert attaches no backfill when retry disabled', () => {
+test('the environment alone no longer decides whether a recovery happens', () => {
+  // The descriptor is attached whenever a clip is missing. Whether a recovery
+  // is CREATED is decided by enqueueVideoRecovery against the settings row —
+  // see samsaraVideoRecovery.test.js. Deciding it here would mean deciding it
+  // from the environment alone, which let a deployment carrying
+  // SAMSARA_VIDEO_RETRY_ENABLED=false silently defeat an administrator who had
+  // just switched recovery on in the panel.
   process.env.SAMSARA_VIDEO_RETRY_ENABLED = 'false';
   let queued = 0;
   const alert = { text: 'x' };
   enqueueFormattedAlert(alert, { id: 'evt-off' }, () => { queued += 1; });
-  assert.equal(queued, 1);
-  assert.equal(alert.videoBackfill, undefined);
+  assert.equal(queued, 1, 'the alert still goes out immediately, as always');
+  assert.ok(alert.videoBackfill, 'and the settings get the final say, not this');
   delete process.env.SAMSARA_VIDEO_RETRY_ENABLED;
 });
 
@@ -93,59 +89,6 @@ test('enqueueFormattedAlert attaches no backfill when eventId missing', () => {
   enqueueFormattedAlert(alert, {}, () => { queued += 1; });
   assert.equal(queued, 1);
   assert.equal(alert.videoBackfill, undefined);
-});
-
-test('inferVideoRetrievalParams tolerates invalid start with valid end', () => {
-  const out = inferVideoRetrievalParams({
-    asset: { id: 'veh-1' },
-    startMs: 'not-a-time',
-    endMs: '2026-05-29T14:56:32.338Z',
-  });
-  assert.equal(out.vehicleId, 'veh-1');
-  assert.equal(out.startTime, '2026-05-29T14:56:32.338Z');
-  assert.equal(out.endTime, '2026-05-29T14:56:32.338Z');
-});
-
-test('pollRetrievedVideoUrls continues after transient polling failure', async () => {
-  let calls = 0;
-  const fetchImpl = async () => {
-    calls += 1;
-    if (calls === 1) {
-      return {
-        ok: false,
-        status: 500,
-        text: async () => 'temporary backend issue',
-      };
-    }
-    return {
-      ok: true,
-      text: async () => JSON.stringify({
-        data: {
-          media: [
-            {
-              mediaType: 'videoHighRes',
-              input: 'dashcamRoadFacing',
-              urlInfo: { url: 'https://retrieved-after-retry.mp4' },
-            },
-          ],
-        },
-      }),
-    };
-  };
-
-  const out = await pollRetrievedVideoUrls({
-    vehicleId: 'veh-1',
-    startTime: '2026-05-29T14:56:00.000Z',
-    endTime: '2026-05-29T14:56:32.338Z',
-    apiKey: 'k',
-    baseUrl: 'https://api.samsara.com',
-    fetchImpl,
-    sleepImpl: async () => {},
-    maxPolls: 2,
-    pollIntervalMs: 0,
-  });
-
-  assert.equal(out.forwardUrl, 'https://retrieved-after-retry.mp4');
 });
 
 test('isVideoRetryEnabled defaults to true', () => {

@@ -29,45 +29,88 @@ event that occurred even if it was offline or restarting.
 
 ---
 
-## Immediate delivery + video backfill
+## Immediate delivery + durable video recovery
 
 Harsh braking / acceleration / turn events almost always fire **before** their
 dashcam clip has finished uploading, so the video is not yet available on the
-first poll. Instead of holding the whole notification back waiting for video,
-the service now:
+first poll. **The alert is never held back for it.**
 
-1. **Sends the alert immediately** — text-only when there is no clip yet. Fast
-   alerts are the priority; a missing video never delays the notification.
-2. **Comes back a short while later** (`SAMSARA_VIDEO_RETRY_DELAY_MS`, default
-   60s) and **re-reads the event** through the same `/fleet/safety-events`
-   time-window endpoint. Once the clip has uploaded, `downloadForwardVideoUrl`
-   is populated and this cheap path finds it — no camera job needed.
-3. **If it is still missing, it generates the video itself** by triggering
-   Samsara media retrieval (`POST /cameras/media/retrieval`) and polling
-   `GET /cameras/media` until the clip is produced.
-4. **Folds the video into the messages already sent** so each destination ends
-   up with a **single clean notification** — the original event text **plus** the
-   video — in the "Samsara Notifications" group, every subscriber, **and** the
-   matched driver group. No separate follow-up message is posted.
+1. **The alert goes out immediately** — text-only when there is no clip yet.
+   A missing video never delays a safety notification.
+2. **A durable recovery job is written** to `samsara_video_recovery_jobs` in the
+   shared Postgres, carrying the event, the Telegram messages that already show
+   its text, and when to look again. This is the part that used to be an
+   in-memory `setTimeout`: a restart or redeploy inside the wait window silently
+   dropped every pending video, and the text alert had already gone out so
+   nothing looked broken.
+3. **After the configured initial delay** (default **5 minutes**, set in the
+   admin panel) the event is **re-read**, and the camera's own media listing is
+   checked. Most clips have finished uploading by then, and neither call asks a
+   truck to produce anything.
+4. **If it is still missing, footage is requested — once.** The retrieval id
+   Samsara returns is stored on the job, so every later check polls **that**
+   request instead of queueing another for the same seconds of video. What
+   stops a second request is `retrieval_requested_at`, not the id: a request
+   Samsara accepted without naming one, and a request whose outcome cannot be
+   known (a timeout — it may well have landed), both mean *stop asking*. Only a
+   refusal carrying an HTTP status is proof it did not land, and only that is
+   worth re-asking, within the attempt budget.
+5. **Once the clip exists it is folded into the messages already sent** — the
+   notifications group, every subscriber, **and** the matched driver group —
+   each keeping its own original caption. No separate follow-up message.
+6. **The job ends in a state that says what happened**: `completed`, `no_video`,
+   or `failed` with the last error. Nothing is abandoned silently, and the queue
+   is visible in the admin panel under **Settings → Samsara**.
 
 > **How the fold-in works.** Telegram cannot turn an existing *text* message
 > into a *video* message in place (`editMessageMedia` only works on messages that
-> already contain media). So the backfill does the cleanest supported
+> already contain media). So the recovery does the cleanest supported
 > equivalent: it **sends a new video message whose caption is the original
 > notification text, then deletes the original text-only message**. The video is
-> sent first and the delete second, so a failed send never loses the alert and a
-> failed delete never loses the video. The driver group keeps its own
-> (AI-rephrased) caption. Captions longer than Telegram's 1024-char media limit
-> are truncated for the video message (the standard alert is well under this).
+> sent first and the delete second, so **a failed video send never loses the
+> alert** and a failed delete never loses the video. Targets that could not be
+> reached are kept on the job, so a retry goes only where the video is still
+> missing — a group that already received it can never get a second copy.
+>
+> The surviving targets are written in the **same statement** as the job's new
+> status, so "these destinations have their video" and "this is where the job
+> stands" cannot land separately — a retry can never re-send where a send
+> succeeded. A terminal write that does not stick is logged as an error rather
+> than reported as a completed recovery.
+>
+> The driver group keeps its own (AI-rephrased) caption. Captions longer than
+> Telegram's 1024-char media limit are truncated for the video message (the
+> standard alert is well under this).
 
-Set `SAMSARA_VIDEO_RETRY_ENABLED=false` to disable the backfill entirely
-(text-only alerts, never enriched with video).
+### Configuring it
 
-Note: the backfill is driven by an in-memory timer, so it is best-effort — if
-the process restarts during the wait window, that one event's video is not
-backfilled (the text alert was already delivered and is never re-sent).
+Everything above is configured from the **admin panel** (`bot-backend` →
+**Settings → Samsara**), which writes one `samsara_settings` row this service
+reads over the database the two already share:
 
----
+| Setting | Default |
+|---|---|
+| Samsara enabled, API key, API base | key inherited from `SAMSARA_API_KEY` |
+| Enable automatic missing-video recovery | on |
+| Wait before re-checking Samsara | 300 s (5 minutes) |
+| Ask Samsara to retrieve footage when the re-check still has none | on |
+| Time between later checks / give up after | 300 s / 12 checks |
+| Footage window around the event | 15 s before, 45 s after |
+| Largest clip to download | 25 MB |
+| Poll speeding events | on |
+
+**No new Render environment variable is required.** Every value falls back to
+the environment variable this service has always read
+(`SAMSARA_API_KEY`, `SAMSARA_API_BASE`, `SAMSARA_VIDEO_RETRY_ENABLED`,
+`SAMSARA_VIDEO_RETRY_DELAY_MS`, `SAMSARA_SPEEDING_ENABLED`,
+`SAMSARA_MAX_VIDEO_BYTES`), so a deployment that changes nothing behaves exactly
+as before. `SAMSARA_VIDEO_RETRY_ENABLED=false` still vetoes recovery outright.
+
+The saved API key is encrypted with an AES-256-GCM envelope keyed from a secret
+both services already hold — see `src/sharedIntegrationCrypto.js` for exactly
+what and why. If this service cannot open it, it says so in the log and falls
+back to `SAMSARA_API_KEY` rather than losing Samsara. Setting the same
+`INTEGRATION_SECRET_KEY` on both services is an optional upgrade.
 
 ## Driver-group speeding-video music overlay (optional)
 

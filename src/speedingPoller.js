@@ -11,10 +11,34 @@ const { Pool } = require('pg');
 const { formatAlert } = require('./formatter');
 const { reverseGeocode } = require('./geocoder');
 const { enqueueFormattedAlert } = require('./videoRetryDelivery');
+const { loadSamsaraConfig } = require('./samsaraSettings');
 
-const SAMSARA_API_KEY = process.env.SAMSARA_API_KEY;
-const SAMSARA_API_BASE = process.env.SAMSARA_API_BASE || 'https://api.samsara.com';
-const SPEEDING_ENABLED = process.env.SAMSARA_SPEEDING_ENABLED !== 'false';
+// ── The Samsara credential, base URL and the speeding switch ─────────────────
+// MUTABLE, and `executePoll` is their only writer. They start as the
+// environment variables this service has always used and are refreshed from the
+// admin-panel settings row at the top of every poll, so replacing the API key
+// or turning speeding events off in the panel takes effect within a cycle
+// instead of needing a redeploy.
+let SAMSARA_API_KEY = process.env.SAMSARA_API_KEY;
+let SAMSARA_API_BASE = process.env.SAMSARA_API_BASE || 'https://api.samsara.com';
+let SPEEDING_ENABLED = process.env.SAMSARA_SPEEDING_ENABLED !== 'false';
+
+async function refreshRuntimeConfig() {
+  try {
+    const cfg = await loadSamsaraConfig();
+    if (cfg.apiKey) SAMSARA_API_KEY = cfg.apiKey;
+    if (cfg.apiBase) SAMSARA_API_BASE = cfg.apiBase;
+    // The settings row decides, and it already falls back to
+    // SAMSARA_SPEEDING_ENABLED when nothing is saved. ANDing the env in as
+    // well would let a deployment silently defeat an administrator who had
+    // just switched speeding back on in the panel.
+    SPEEDING_ENABLED = cfg.speedingEventsEnabled !== false && cfg.enabled !== false;
+    return cfg;
+  } catch (err) {
+    console.warn('[SpeedPoller] Could not refresh Samsara settings:', err.message);
+    return null;
+  }
+}
 const ENABLE_METRICS = process.env.SAMSARA_POLL_METRICS !== 'false';
 const POLL_BOOTSTRAP_WINDOW_MS = 86_400_000;
 const POLL_WATERMARK_OVERLAP_MS = 7_200_000;
@@ -318,92 +342,6 @@ async function transformV2SpeedEvent(rawEvent, options = {}) {
   };
 }
 
-async function tryRetrieveSpeedingVideo(rawEvent, options = {}) {
-  const fetchImpl = options.fetchImpl || fetch;
-  const sleepImpl = options.sleepImpl || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const maxPolls = Number.isFinite(options.maxPolls) ? options.maxPolls : 8;
-  const pollIntervalMs = Number.isFinite(options.pollIntervalMs) ? options.pollIntervalMs : 15_000;
-  const skipRetrievalRequest = options.skipRetrievalRequest === true;
-
-  const vehicleId = rawEvent.asset?.id || rawEvent.vehicle?.id || null;
-  const startTime = rawEvent.startMs || rawEvent.time || rawEvent.createdAtTime;
-  const endTime = rawEvent.endMs || rawEvent.time || rawEvent.updatedAtTime || startTime;
-
-  if (!vehicleId || !startTime || !endTime) return null;
-  if (rawEvent.media?.length || rawEvent.downloadForwardVideoUrl) {
-    return rawEvent.downloadForwardVideoUrl || rawEvent.media?.[0]?.url || null;
-  }
-
-  if (!skipRetrievalRequest) {
-    try {
-      const reqRes = await fetchImpl(`${SAMSARA_API_BASE}/cameras/media/retrieval`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${SAMSARA_API_KEY}`,
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          vehicleId,
-          startTime,
-          endTime,
-          mediaType: 'videoHighRes',
-          inputs: ['dashcamRoadFacing', 'dashcamDriverFacing'],
-        }),
-      });
-
-      const reqText = await reqRes.text();
-      if (!reqRes.ok) {
-        throw new Error(`retrieval ${reqRes.status}: ${reqText.slice(0, 200)}`);
-      }
-    } catch (err) {
-      console.warn('[SpeedPoller] Media retrieval request failed:', err.message);
-      return null;
-    }
-  }
-
-  const queryStart = new Date(Date.parse(startTime) - 60_000).toISOString();
-  const queryEnd = new Date(Date.parse(endTime) + 120_000).toISOString();
-
-  for (let i = 0; i < maxPolls; i++) {
-    await sleepImpl(pollIntervalMs);
-    try {
-      const url = new URL(`${SAMSARA_API_BASE}/cameras/media`);
-      url.searchParams.append('vehicleIds', vehicleId);
-      url.searchParams.append('startTime', queryStart);
-      url.searchParams.append('endTime', queryEnd);
-      url.searchParams.append('mediaTypes', 'videoHighRes');
-      url.searchParams.append('inputs', 'dashcamRoadFacing');
-      url.searchParams.append('inputs', 'dashcamDriverFacing');
-
-      const res = await fetchImpl(url.toString(), {
-        headers: {
-          Authorization: `Bearer ${SAMSARA_API_KEY}`,
-          Accept: 'application/json',
-        },
-      });
-      const text = await res.text();
-      if (!res.ok) {
-        throw new Error(`media list ${res.status}: ${text.slice(0, 200)}`);
-      }
-      const json = text ? JSON.parse(text) : {};
-      const media = json.data?.media || [];
-      const match = media.find((row) => {
-        const mediaType = String(row.mediaType || '');
-        return /video/i.test(mediaType) && row.urlInfo?.url;
-      });
-
-      if (match?.urlInfo?.url) {
-        return match.urlInfo.url;
-      }
-    } catch (err) {
-      console.warn('[SpeedPoller] Media retrieval polling failed:', err.message);
-    }
-  }
-
-  return null;
-}
-
 async function fetchSpeedingEventsPage({ startTime, endTime, cursor }) {
   const url = new URL(`${SAMSARA_API_BASE}/safety-events/stream`);
   url.searchParams.set('startTime', startTime);
@@ -447,8 +385,13 @@ async function executePoll() {
   }
   executePoll.isRunning = true;
 
+  await refreshRuntimeConfig();
+  if (!SPEEDING_ENABLED) {
+    executePoll.isRunning = false;
+    return;
+  }
   if (!SAMSARA_API_KEY) {
-    console.warn('[SpeedPoller] SAMSARA_API_KEY is not set. Cannot poll.');
+    console.warn('[SpeedPoller] No Samsara API key (admin panel or SAMSARA_API_KEY). Cannot poll.');
     executePoll.isRunning = false;
     return;
   }
@@ -500,27 +443,13 @@ async function executePoll() {
             formatted.inwardVideoUrl = null;
           }
 
-          enqueueFormattedAlert(
-            formatted,
-            rawEvent,
-            queueAlert,
-            {
-              // First re-check after 60s without forcing retrieval.
-              refetchFn: async () => {
-                const url = await tryRetrieveSpeedingVideo(rawEvent, {
-                  skipRetrievalRequest: true,
-                  maxPolls: 1,
-                  pollIntervalMs: 0,
-                });
-                return { forwardUrl: url, inwardUrl: null };
-              },
-              // If still missing, then start retrieval job and poll for result.
-              retrievalFn: async () => {
-                const url = await tryRetrieveSpeedingVideo(rawEvent);
-                return { forwardUrl: url, inwardUrl: null };
-              },
-            },
-          );
+          // No video yet? The alert still goes out now, and a DURABLE recovery
+          // job resolves the clip later — see src/videoRecoveryWorker.js. This
+          // used to hand in its own refetch/retrieval closures, a second
+          // implementation of the camera calls that has since been consolidated
+          // into src/cameraMediaRetrieval.js and, unlike this one, survives a
+          // restart.
+          enqueueFormattedAlert(formatted, rawEvent, queueAlert);
 
           totalQueued += 1;
         } catch (eventErr) {
@@ -591,7 +520,6 @@ module.exports = {
 
   _forTest: {
     transformV2SpeedEvent,
-    tryRetrieveSpeedingVideo,
     isSpeedingLike,
     resetState() {
       ALERT_QUEUE.length = 0;

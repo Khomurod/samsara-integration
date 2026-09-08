@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 
 const speedPoller = require('../src/speedingPoller');
 
-const { transformV2SpeedEvent, tryRetrieveSpeedingVideo } = speedPoller._forTest;
+const { transformV2SpeedEvent } = speedPoller._forTest;
 
 test.afterEach(() => {
   speedPoller._forTest.resetState();
@@ -48,97 +48,4 @@ test('transformV2SpeedEvent maps v2 severe speeding payload with vehicle lookup'
     payload.data.conditions[0].details.speed.thresholdSpeedKilometersPerHour,
     96,
   );
-});
-
-test('tryRetrieveSpeedingVideo returns URL when polling finds video', async () => {
-  const responses = [
-    {
-      ok: true,
-      text: async () => JSON.stringify({ data: { retrievalId: 'r1' } }),
-    },
-    {
-      ok: true,
-      text: async () => JSON.stringify({ data: { media: [] } }),
-    },
-    {
-      ok: true,
-      text: async () => JSON.stringify({
-        data: {
-          media: [
-            {
-              mediaType: 'videoHighRes',
-              urlInfo: { url: 'https://s3.samsara.com/video.mp4' },
-            },
-          ],
-        },
-      }),
-    },
-  ];
-
-  const url = await tryRetrieveSpeedingVideo({
-    asset: { id: '281474999386026' },
-    startMs: '2026-05-28T17:07:48.000Z',
-    endMs: '2026-05-28T17:08:30.004Z',
-  }, {
-    fetchImpl: async () => {
-      const next = responses.shift();
-      assert.ok(next, 'unexpected extra fetch call');
-      return next;
-    },
-    sleepImpl: async () => {},
-    maxPolls: 3,
-    pollIntervalMs: 1,
-  });
-
-  assert.equal(url, 'https://s3.samsara.com/video.mp4');
-});
-
-test('tryRetrieveSpeedingVideo returns null when retrieval request fails', async () => {
-  const url = await tryRetrieveSpeedingVideo({
-    asset: { id: '281474999386026' },
-    startMs: '2026-05-28T17:07:48.000Z',
-    endMs: '2026-05-28T17:08:30.004Z',
-  }, {
-    fetchImpl: async () => ({
-      ok: false,
-      status: 401,
-      text: async () => 'unauthorized',
-    }),
-  });
-
-  assert.equal(url, null);
-});
-
-test('tryRetrieveSpeedingVideo returns null when poll times out', async () => {
-  const responses = [
-    {
-      ok: true,
-      text: async () => JSON.stringify({ data: { retrievalId: 'r1' } }),
-    },
-    {
-      ok: true,
-      text: async () => JSON.stringify({ data: { media: [] } }),
-    },
-    {
-      ok: true,
-      text: async () => JSON.stringify({ data: { media: [] } }),
-    },
-  ];
-
-  const url = await tryRetrieveSpeedingVideo({
-    asset: { id: '281474999386026' },
-    startMs: '2026-05-28T17:07:48.000Z',
-    endMs: '2026-05-28T17:08:30.004Z',
-  }, {
-    fetchImpl: async () => {
-      const next = responses.shift();
-      assert.ok(next, 'unexpected extra fetch call');
-      return next;
-    },
-    sleepImpl: async () => {},
-    maxPolls: 2,
-    pollIntervalMs: 1,
-  });
-
-  assert.equal(url, null);
 });

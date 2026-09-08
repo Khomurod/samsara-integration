@@ -18,9 +18,28 @@ const { formatAlert } = require('./formatter');
 const { reverseGeocode } = require('./geocoder');
 const { enrichSafetyEventWithMediaIfNeeded } = require('./safetyEventMedia');
 const { enqueueFormattedAlert } = require('./videoRetryDelivery');
+const { loadSamsaraConfig } = require('./samsaraSettings');
 
-const SAMSARA_API_KEY = process.env.SAMSARA_API_KEY;
-const SAMSARA_API_BASE = process.env.SAMSARA_API_BASE || 'https://api.samsara.com';
+// ── The Samsara credential and base URL ──────────────────────────────────────
+// MUTABLE, and `executePoll` is their only writer. They start as the
+// environment variables this service has always used and are refreshed from the
+// admin-panel settings row at the top of every poll, so replacing the API key
+// in the panel takes effect within a cycle instead of needing a redeploy. An
+// unreadable or absent database value leaves whatever was working in place.
+let SAMSARA_API_KEY = process.env.SAMSARA_API_KEY;
+let SAMSARA_API_BASE = process.env.SAMSARA_API_BASE || 'https://api.samsara.com';
+
+async function refreshRuntimeConfig() {
+    try {
+        const cfg = await loadSamsaraConfig();
+        if (cfg.apiKey) SAMSARA_API_KEY = cfg.apiKey;
+        if (cfg.apiBase) SAMSARA_API_BASE = cfg.apiBase;
+        return cfg;
+    } catch (err) {
+        console.warn('[Poller] Could not refresh Samsara settings:', err.message);
+        return null;
+    }
+}
 const PREVENT_POLL_OVERLAP = process.env.SAMSARA_PREVENT_POLL_OVERLAP !== 'false';
 const USE_POLL_WATERMARK = process.env.SAMSARA_POLL_USE_WATERMARK !== 'false';
 const ENABLE_POLL_METRICS = process.env.SAMSARA_POLL_METRICS !== 'false';
@@ -251,8 +270,14 @@ async function executePoll() {
     }
     executePoll.isRunning = true;
 
+    const cfg = await refreshRuntimeConfig();
+    if (cfg && cfg.enabled === false) {
+        console.log('[Poller] Samsara is disabled in the admin panel; skipping this poll.');
+        executePoll.isRunning = false;
+        return;
+    }
     if (!SAMSARA_API_KEY) {
-        console.warn('[Poller] SAMSARA_API_KEY is not set. Cannot poll.');
+        console.warn('[Poller] No Samsara API key (admin panel or SAMSARA_API_KEY). Cannot poll.');
         executePoll.isRunning = false;
         return;
     }
