@@ -1,13 +1,17 @@
 /**
  * videoBackfill.js
  *
- * When a Samsara safety event is delivered immediately but the dashcam video
- * was not yet available, this module comes back a short while later, resolves
- * the video (refetch the event → if still missing, trigger Samsara's media
- * retrieval/generation and poll for it), and folds the video INTO the original
- * alert message — in the Samsara notifications group, every subscriber, and the
- * matched driver group. The end state is a single clean notification that
- * carries the original event text plus the video, not two separate messages.
+ * FOLDING A RECOVERED VIDEO INTO THE ALERTS THAT ALREADY WENT OUT — in the
+ * Samsara notifications group, every subscriber, and the matched driver group.
+ * The end state is a single clean notification carrying the original event text
+ * plus the video, not two separate messages.
+ *
+ * WHEN that happens is no longer decided here. This module used to own an
+ * in-memory `setTimeout` + `Set`, which meant a restart or a redeploy inside
+ * the wait window silently dropped every pending video. Scheduling now lives in
+ * the durable job table (src/videoRecoveryStore.js) worked by
+ * src/videoRecoveryWorker.js; what is left here is the part that was always
+ * right — how a text-only alert becomes a video one.
  *
  * How the "fold-in" works: Telegram cannot convert a text-only message into a
  * media message in place (`editMessageMedia` only works on messages that
@@ -20,60 +24,6 @@
  * All collaborators are injected so the flow is unit-testable with no real
  * network or Telegram calls.
  */
-
-const {
-  runVideoRetrievalFlow,
-  getVideoRetryDelayMs,
-} = require('./videoRetryDelivery');
-const { refetchVideoUrlsViaFleetWindow } = require('./safetyEventMedia');
-
-// In-memory guard: event ids currently scheduled or running a backfill. Keeps a
-// single event from being backfilled twice (e.g. if delivery is retried). Timers
-// are in-memory anyway, so this set does not need to survive restarts.
-const inFlight = new Set();
-
-function isVideoBackfillEnabled() {
-  // Reuse the existing retry toggle so operators have a single switch.
-  return process.env.SAMSARA_VIDEO_RETRY_ENABLED !== 'false';
-}
-
-/**
- * Resolve dashcam video URLs for an event: refetch the safety event first
- * (video often finishes uploading a minute later); if still absent, trigger the
- * media retrieval/generation flow and poll for the produced clip.
- */
-async function resolveEventVideoUrls({
-  eventId,
-  rawEvent,
-  apiKey,
-  baseUrl,
-  refetchFn,
-  retrievalFn,
-  log = console,
-}) {
-  const doRefetch = refetchFn
-    || (() => refetchVideoUrlsViaFleetWindow(eventId, rawEvent, apiKey, baseUrl));
-  const doRetrieval = retrievalFn || (() => runVideoRetrievalFlow(rawEvent, { apiKey, baseUrl }));
-
-  try {
-    let urls = await doRefetch();
-    if (urls?.forwardUrl || urls?.inwardUrl) {
-      log.log?.(`[VideoBackfill] event ${eventId}: video found on refetch`);
-      return { forwardUrl: urls.forwardUrl || null, inwardUrl: urls.inwardUrl || null };
-    }
-
-    log.log?.(`[VideoBackfill] event ${eventId}: no video on refetch, requesting retrieval/generation`);
-    urls = await doRetrieval();
-    if (urls?.forwardUrl || urls?.inwardUrl) {
-      log.log?.(`[VideoBackfill] event ${eventId}: video found after retrieval`);
-      return { forwardUrl: urls.forwardUrl || null, inwardUrl: urls.inwardUrl || null };
-    }
-  } catch (err) {
-    log.warn?.(`[VideoBackfill] event ${eventId}: video resolve failed: ${err.message}`);
-  }
-
-  return { forwardUrl: null, inwardUrl: null };
-}
 
 // Telegram media captions are capped at 1024 chars (vs 4096 for a text message).
 // The standard safety-event notification is well under this, but guard anyway so
@@ -203,14 +153,18 @@ async function runVideoBackfill({
   log = console,
 }) {
   if (!videoUrls || (!videoUrls.forwardUrl && !videoUrls.inwardUrl)) {
-    return { posted: 0, attempted: 0 };
+    return { posted: 0, attempted: 0, failedTargets: [...(sentMessages || [])] };
   }
 
   let posted = 0;
   let attempted = 0;
+  // The refs that did NOT get their video. The durable recovery writes these
+  // back to the job, so a retry re-posts only where it is still missing and can
+  // never put a second video into a group that already has one.
+  const failedTargets = [];
   for (const ref of sentMessages || []) {
     const bot = typeof resolveBot === 'function' ? resolveBot(ref.botKind) : null;
-    if (!bot) continue;
+    if (!bot) { failedTargets.push(ref); continue; }
     attempted += 1;
     // The music overlay is applied ONLY to the driver-group copy. Notification-
     // group / subscriber backfills always get the original video.
@@ -230,11 +184,13 @@ async function runVideoBackfill({
         log,
       });
       if (ok) posted += 1;
+      else failedTargets.push(ref);
     } catch (err) {
+      failedTargets.push(ref);
       log.error?.(`[VideoBackfill] replace in ${ref.chatId} threw: ${err.message}`);
     }
   }
-  return { posted, attempted };
+  return { posted, attempted, failedTargets };
 }
 
 // Fallback caption only — the backfill normally reuses each target's original
@@ -242,81 +198,10 @@ async function runVideoBackfill({
 // ref somehow arrives without its caption, so the video is never sent uncaptioned.
 const DEFAULT_BACKFILL_CAPTION = '🎥 <b>Event video is now available.</b>';
 
-/**
- * Schedule the video backfill: after a delay, resolve the video and fold it into
- * the original alert messages (send video with the original text as caption, then
- * delete the original text message). Returns true if a backfill was scheduled.
- */
-function scheduleVideoBackfill({
-  eventId,
-  rawEvent,
-  sentMessages,
-  apiKey,
-  baseUrl,
-  resolveBot,
-  makeGetVideoBuffer,
-  caption = DEFAULT_BACKFILL_CAPTION,
-  delayMs,
-  setTimer = (fn, ms) => setTimeout(fn, ms),
-  refetchFn,
-  retrievalFn,
-  // Driver-group-only music overlay + speeding flag, threaded to runVideoBackfill.
-  prepareDriverVideo = null,
-  isSpeeding = false,
-  log = console,
-}) {
-  if (!eventId) return false;
-  if (!Array.isArray(sentMessages) || sentMessages.length === 0) return false;
-  if (inFlight.has(eventId)) {
-    log.log?.(`[VideoBackfill] event ${eventId}: backfill already in flight, skipping duplicate`);
-    return false;
-  }
-  inFlight.add(eventId);
-
-  const waitMs = Number.isFinite(delayMs) ? delayMs : getVideoRetryDelayMs();
-  log.log?.(
-    `[VideoBackfill] event ${eventId}: scheduling video backfill in ${Math.round(waitMs / 1000)}s `
-    + `for ${sentMessages.length} sent message(s)`,
-  );
-
-  setTimer(async () => {
-    try {
-      const urls = await resolveEventVideoUrls({
-        eventId, rawEvent, apiKey, baseUrl, refetchFn, retrievalFn, log,
-      });
-      if (!urls.forwardUrl && !urls.inwardUrl) {
-        log.log?.(`[VideoBackfill] event ${eventId}: video never became available; leaving text alerts as-is`);
-        return;
-      }
-      log.log?.(`[VideoBackfill] event ${eventId}: video available, folding into ${sentMessages.length} original message(s)`);
-      const getVideoBuffer = typeof makeGetVideoBuffer === 'function' ? makeGetVideoBuffer() : null;
-      if (!getVideoBuffer) {
-        log.warn?.(`[VideoBackfill] event ${eventId}: no video downloader available, cannot post backfill`);
-        return;
-      }
-      const res = await runVideoBackfill({
-        sentMessages, videoUrls: urls, resolveBot, getVideoBuffer, caption,
-        prepareDriverVideo, isSpeeding, eventId, log,
-      });
-      log.log?.(`[VideoBackfill] event ${eventId}: folded video into ${res.posted}/${res.attempted} target message(s)`);
-    } catch (err) {
-      log.warn?.(`[VideoBackfill] event ${eventId}: backfill flow failed: ${err.message}`);
-    } finally {
-      inFlight.delete(eventId);
-    }
-  }, waitMs);
-
-  return true;
-}
-
 module.exports = {
-  isVideoBackfillEnabled,
-  resolveEventVideoUrls,
   replaceMessageWithVideo,
   runVideoBackfill,
-  scheduleVideoBackfill,
   fitCaption,
   DEFAULT_BACKFILL_CAPTION,
   TELEGRAM_CAPTION_LIMIT,
-  _forTest: { inFlight },
 };

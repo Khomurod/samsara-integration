@@ -35,6 +35,11 @@ services:
         sync: false
 
       # --- Samsara API ---
+      # FALLBACKS ONLY. The admin panel (bot-backend → Settings → Samsara)
+      # writes a `samsara_settings` row this service reads over the shared
+      # database, and a value saved there wins. These keep an existing
+      # deployment working untouched — nothing has to be re-entered, and the
+      # missing-video recovery settings need no environment variable at all.
       - key: SAMSARA_API_KEY
         sync: false
       - key: SAMSARA_API_BASE

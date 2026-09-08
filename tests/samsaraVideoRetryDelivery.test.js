@@ -9,6 +9,7 @@ const {
   inferVideoRetrievalParams,
   pollRetrievedVideoUrls,
   DEFAULT_DELAY_MS,
+  MIN_DELAY_MS,
 } = require('../src/videoRetryDelivery');
 
 const origRetryEnabled = process.env.SAMSARA_VIDEO_RETRY_ENABLED;
@@ -21,13 +22,19 @@ test.after(() => {
   else process.env.SAMSARA_VIDEO_RETRY_DELAY_MS = origRetryDelay;
 });
 
-test('getVideoRetryDelayMs defaults and clamps', () => {
+test('getVideoRetryDelayMs defaults to five minutes and no longer caps a long wait', () => {
   delete process.env.SAMSARA_VIDEO_RETRY_DELAY_MS;
   assert.equal(getVideoRetryDelayMs(), DEFAULT_DELAY_MS);
-  process.env.SAMSARA_VIDEO_RETRY_DELAY_MS = '10000';
-  assert.equal(getVideoRetryDelayMs(), 30_000);
-  process.env.SAMSARA_VIDEO_RETRY_DELAY_MS = '999999';
-  assert.equal(getVideoRetryDelayMs(), 180_000);
+  assert.equal(DEFAULT_DELAY_MS, 300_000, 'the shipped default is the 5 minutes the admin panel shows');
+
+  // The old ceiling was three minutes, so the operator's chosen delay could
+  // never actually be honoured — an admin-set 5 minutes silently became 3.
+  process.env.SAMSARA_VIDEO_RETRY_DELAY_MS = '600000';
+  assert.equal(getVideoRetryDelayMs(), 600_000, 'a ten-minute wait is honoured, not clamped');
+
+  // A floor survives, purely so a mis-set value cannot become a tight loop.
+  process.env.SAMSARA_VIDEO_RETRY_DELAY_MS = '100';
+  assert.equal(getVideoRetryDelayMs(), MIN_DELAY_MS);
   delete process.env.SAMSARA_VIDEO_RETRY_DELAY_MS;
 });
 
@@ -102,8 +109,38 @@ test('inferVideoRetrievalParams tolerates invalid start with valid end', () => {
     endMs: '2026-05-29T14:56:32.338Z',
   });
   assert.equal(out.vehicleId, 'veh-1');
-  assert.equal(out.startTime, '2026-05-29T14:56:32.338Z');
-  assert.equal(out.endTime, '2026-05-29T14:56:32.338Z');
+  // It used to answer start === end === the one usable timestamp. Samsara
+  // cannot produce a clip of no duration, so that request could only ever come
+  // back empty. The window is now anchored on the event and genuinely wide.
+  assert.ok(out.durationSeconds > 0, 'a retrieval window must have real duration');
+  assert.ok(Date.parse(out.endTime) > Date.parse(out.startTime));
+  assert.equal(out.startTime, '2026-05-29T14:56:17.338Z');
+  assert.equal(out.endTime, '2026-05-29T14:57:17.338Z');
+});
+
+test('inferVideoRetrievalParams never returns a zero-length window, whatever the event says', () => {
+  // The common shape: one instant, reported as both ends.
+  const instant = inferVideoRetrievalParams({
+    vehicle: { id: 'veh-2' },
+    startMs: '2026-05-29T14:56:00.000Z',
+    endMs: '2026-05-29T14:56:00.000Z',
+  });
+  assert.ok(instant.durationSeconds >= 5);
+  assert.notEqual(instant.startTime, instant.endTime);
+
+  // And the other direction: a long event is bounded, so one alert cannot ask a
+  // truck to upload half an hour of video.
+  const long = inferVideoRetrievalParams({
+    asset: { id: 'veh-3' },
+    startMs: '2026-05-29T14:00:00.000Z',
+    endMs: '2026-05-29T15:00:00.000Z',
+  });
+  assert.ok(long.durationSeconds <= 600, `expected a bounded window, got ${long.durationSeconds}s`);
+
+  // No vehicle, or no usable time at all, is honestly nothing rather than a
+  // request Samsara will reject.
+  assert.equal(inferVideoRetrievalParams({ time: '2026-05-29T14:56:00.000Z' }), null);
+  assert.equal(inferVideoRetrievalParams({ asset: { id: 'veh-4' } }), null);
 });
 
 test('pollRetrievedVideoUrls continues after transient polling failure', async () => {

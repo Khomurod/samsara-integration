@@ -1,54 +1,22 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
+/**
+ * Folding a recovered video into alerts that already went out.
+ *
+ * WHEN a recovery runs is not tested here any more — that moved to the durable
+ * job table and its worker (tests/samsaraVideoRecovery.test.js). What is left
+ * is the part that was always right: a text-only alert becomes a video one by
+ * sending the video FIRST and deleting the original only on success.
+ */
 const {
-  resolveEventVideoUrls,
   replaceMessageWithVideo,
   runVideoBackfill,
-  scheduleVideoBackfill,
   fitCaption,
   TELEGRAM_CAPTION_LIMIT,
-  _forTest,
 } = require('../src/videoBackfill');
 
 const silentLog = { log: () => {}, warn: () => {}, error: () => {} };
-
-test.afterEach(() => {
-  _forTest.inFlight.clear();
-});
-
-test('resolveEventVideoUrls returns refetch result without calling retrieval', async () => {
-  let retrievalCalled = 0;
-  const urls = await resolveEventVideoUrls({
-    eventId: 'e1',
-    refetchFn: async () => ({ forwardUrl: 'https://f.mp4', inwardUrl: null }),
-    retrievalFn: async () => { retrievalCalled += 1; return { forwardUrl: null, inwardUrl: null }; },
-    log: silentLog,
-  });
-  assert.equal(urls.forwardUrl, 'https://f.mp4');
-  assert.equal(retrievalCalled, 0);
-});
-
-test('resolveEventVideoUrls falls back to retrieval/generation when refetch empty', async () => {
-  const urls = await resolveEventVideoUrls({
-    eventId: 'e2',
-    refetchFn: async () => ({ forwardUrl: null, inwardUrl: null }),
-    retrievalFn: async () => ({ forwardUrl: 'https://generated.mp4', inwardUrl: 'https://in.mp4' }),
-    log: silentLog,
-  });
-  assert.equal(urls.forwardUrl, 'https://generated.mp4');
-  assert.equal(urls.inwardUrl, 'https://in.mp4');
-});
-
-test('resolveEventVideoUrls swallows errors and returns nulls', async () => {
-  const urls = await resolveEventVideoUrls({
-    eventId: 'e3',
-    refetchFn: async () => { throw new Error('boom'); },
-    retrievalFn: async () => ({ forwardUrl: 'x', inwardUrl: null }),
-    log: silentLog,
-  });
-  assert.deepEqual(urls, { forwardUrl: null, inwardUrl: null });
-});
 
 test('fitCaption leaves short captions untouched and truncates over-long ones', () => {
   const short = '<b>Alert</b>\nDriver event';
@@ -198,100 +166,4 @@ test('runVideoBackfill does nothing when no video resolved', async () => {
   });
   assert.equal(res.posted, 0);
   assert.equal(res.attempted, 0);
-});
-
-test('scheduleVideoBackfill resolves video and replaces each target message', async () => {
-  const posted = [];
-  let timerFn = null;
-  const bot = {
-    async sendVideo(chatId, b, o) { posted.push({ chatId, caption: o.caption }); return { message_id: 1 }; },
-    async deleteMessage(chatId, messageId) { posted.push({ deleted: messageId }); },
-  };
-
-  const scheduled = scheduleVideoBackfill({
-    eventId: 'evt-sched',
-    rawEvent: { id: 'evt-sched' },
-    sentMessages: [
-      { botKind: 'notification', chatId: '-500', messageId: 21, caption: 'text a' },
-      { botKind: 'driver', chatId: '-700', messageId: 22, caption: 'text b' },
-    ],
-    resolveBot: () => bot,
-    makeGetVideoBuffer: () => async () => Buffer.from('x'),
-    delayMs: 0,
-    setTimer: (fn) => { timerFn = fn; },
-    refetchFn: async () => ({ forwardUrl: null, inwardUrl: null }),
-    retrievalFn: async () => ({ forwardUrl: 'https://generated.mp4', inwardUrl: null }),
-    log: silentLog,
-  });
-
-  assert.equal(scheduled, true);
-  assert.ok(timerFn);
-  await timerFn();
-  const sends = posted.filter((p) => p.caption);
-  const deletes = posted.filter((p) => p.deleted);
-  assert.equal(sends.length, 2);
-  assert.equal(deletes.length, 2);
-  assert.deepEqual(sends.map((s) => s.caption), ['text a', 'text b']);
-  assert.deepEqual(deletes.map((d) => d.deleted), [21, 22]);
-});
-
-test('scheduleVideoBackfill leaves messages untouched when no video ever appears', async () => {
-  let timerFn = null;
-  let sends = 0;
-  let deletes = 0;
-  const bot = {
-    async sendVideo() { sends += 1; },
-    async sendMediaGroup() { sends += 1; },
-    async deleteMessage() { deletes += 1; },
-  };
-
-  scheduleVideoBackfill({
-    eventId: 'evt-none',
-    rawEvent: { id: 'evt-none' },
-    sentMessages: [{ botKind: 'notification', chatId: '-500', messageId: 1, caption: 't' }],
-    resolveBot: () => bot,
-    makeGetVideoBuffer: () => async () => Buffer.from('x'),
-    delayMs: 0,
-    setTimer: (fn) => { timerFn = fn; },
-    refetchFn: async () => ({ forwardUrl: null, inwardUrl: null }),
-    retrievalFn: async () => ({ forwardUrl: null, inwardUrl: null }),
-    log: silentLog,
-  });
-
-  await timerFn();
-  // No video → original text alert stays exactly as sent; nothing sent or deleted.
-  assert.equal(sends, 0);
-  assert.equal(deletes, 0);
-});
-
-test('scheduleVideoBackfill de-dupes concurrent scheduling for the same event (idempotent)', () => {
-  let scheduledCount = 0;
-  const common = {
-    eventId: 'evt-dup',
-    rawEvent: { id: 'evt-dup' },
-    sentMessages: [{ botKind: 'notification', chatId: '-500', messageId: 1, caption: 't' }],
-    resolveBot: () => ({}),
-    makeGetVideoBuffer: () => async () => null,
-    delayMs: 0,
-    setTimer: () => { scheduledCount += 1; },
-    refetchFn: async () => ({ forwardUrl: null, inwardUrl: null }),
-    retrievalFn: async () => ({ forwardUrl: null, inwardUrl: null }),
-    log: silentLog,
-  };
-
-  const first = scheduleVideoBackfill(common);
-  const second = scheduleVideoBackfill(common);
-  assert.equal(first, true);
-  assert.equal(second, false);
-  assert.equal(scheduledCount, 1);
-});
-
-test('scheduleVideoBackfill returns false with no sent messages', () => {
-  const scheduled = scheduleVideoBackfill({
-    eventId: 'evt-empty',
-    sentMessages: [],
-    setTimer: () => { throw new Error('should not schedule'); },
-    log: silentLog,
-  });
-  assert.equal(scheduled, false);
 });

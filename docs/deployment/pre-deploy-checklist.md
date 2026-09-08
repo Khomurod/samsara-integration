@@ -19,7 +19,8 @@
 |---|---|---|
 | A1 | App starts successfully. | **[AUTO]** `npm test` passes; **[PROD]** logs show pollers + bot started. |
 | A2 | No crash loop. | **[PROD]** one stable Render instance; no repeated restarts. |
-| A3 | No missing env vars. | **[MANUAL]** compare Render env to `.env.example` / `render.yaml` (esp. tokens, `DATABASE_URL`, `SAMSARA_API_KEY`). |
+| A3 | No missing env vars. | **[MANUAL]** compare Render env to `.env.example` / `render.yaml` (esp. tokens, `DATABASE_URL`, `SAMSARA_API_KEY`). **No new variable is required by the settings/recovery work** — the admin panel is the primary home and the environment stays a fallback. |
+| A3a | The Samsara key the panel saved is readable HERE. | **[PROD]** startup logs `[VideoRecovery] Settings: source=database key=database …`. `key=environment` with a key saved in the panel means this service could not decrypt it — re-save it in Settings → Samsara, or set the same `INTEGRATION_SECRET_KEY` on both services. |
 | A4 | Database connection works. | **[PROD]** `GET /health` returns 200; `initPgDb()` succeeded in logs. |
 | A5 | Notification bot connects **and** can see the notifications group. | **[PROD]** `verifyNotificationBotAccess()` logs ✓ for `HARDCODED_GROUP_ID`. |
 | A6 | Token separation intact. | **[AUTO/PROD]** Samsara token ≠ main `BOT_TOKEN` (else exit 78). |
@@ -29,7 +30,9 @@
 | # | What / Why | How to check |
 |---|---|---|
 | B1 | **No duplicate safety alerts.** | **[AUTO]** `samsaraIdempotentDelivery.test.js` (deliver-once; re-run sends to nobody). |
-| B2 | **No duplicate video sends.** | **[AUTO]** `samsaraVideoBackfill.test.js` (in-flight de-dupe; replace-then-delete). |
+| B2 | **No duplicate video sends.** | **[AUTO]** `samsaraVideoBackfill.test.js` (replace-then-delete) + `samsaraVideoRecovery.test.js` (a re-delivered event adds no second recovery). |
+| B2a | **No duplicate Samsara retrieval requests.** | **[AUTO]** `samsaraVideoRecoveryWorker.test.js` (a job holding a retrieval id polls it instead of creating another) + `samsaraVideoRecoveryStore.test.js` (`ON CONFLICT DO NOTHING` on a UNIQUE event id). |
+| B2b | **Pending video recoveries survive a redeploy.** | **[AUTO]** `samsaraVideoRecoveryWorker.test.js` (a fresh worker resumes from the store); **[PROD]** startup logs `[VideoRecovery] Queue on boot: N recovery job(s) still open`. |
 | B3 | Already-delivered target not re-sent when a sibling fails. | **[AUTO]** `samsaraIdempotentDelivery.test.js` (permanent recorded & swallowed). |
 | B4 | Transient failure is retried; succeeded targets are not re-sent. | **[AUTO]** same suite (429 retried). |
 | B5 | Blocked/403 subscriber is skipped, not retried forever. | **[AUTO]** same suite. |

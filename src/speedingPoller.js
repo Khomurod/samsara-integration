@@ -11,10 +11,35 @@ const { Pool } = require('pg');
 const { formatAlert } = require('./formatter');
 const { reverseGeocode } = require('./geocoder');
 const { enqueueFormattedAlert } = require('./videoRetryDelivery');
+const { loadSamsaraConfig } = require('./samsaraSettings');
+const { buildRetrievalWindow } = require('./cameraMediaRetrieval');
 
-const SAMSARA_API_KEY = process.env.SAMSARA_API_KEY;
-const SAMSARA_API_BASE = process.env.SAMSARA_API_BASE || 'https://api.samsara.com';
-const SPEEDING_ENABLED = process.env.SAMSARA_SPEEDING_ENABLED !== 'false';
+// ── The Samsara credential, base URL and the speeding switch ─────────────────
+// MUTABLE, and `executePoll` is their only writer. They start as the
+// environment variables this service has always used and are refreshed from the
+// admin-panel settings row at the top of every poll, so replacing the API key
+// or turning speeding events off in the panel takes effect within a cycle
+// instead of needing a redeploy.
+let SAMSARA_API_KEY = process.env.SAMSARA_API_KEY;
+let SAMSARA_API_BASE = process.env.SAMSARA_API_BASE || 'https://api.samsara.com';
+let SPEEDING_ENABLED = process.env.SAMSARA_SPEEDING_ENABLED !== 'false';
+
+async function refreshRuntimeConfig() {
+  try {
+    const cfg = await loadSamsaraConfig();
+    if (cfg.apiKey) SAMSARA_API_KEY = cfg.apiKey;
+    if (cfg.apiBase) SAMSARA_API_BASE = cfg.apiBase;
+    // The env var stays a veto: a deployment that turned speeding off there
+    // must not be silently re-enabled by a database default.
+    SPEEDING_ENABLED = process.env.SAMSARA_SPEEDING_ENABLED !== 'false'
+      && cfg.speedingEventsEnabled !== false
+      && cfg.enabled !== false;
+    return cfg;
+  } catch (err) {
+    console.warn('[SpeedPoller] Could not refresh Samsara settings:', err.message);
+    return null;
+  }
+}
 const ENABLE_METRICS = process.env.SAMSARA_POLL_METRICS !== 'false';
 const POLL_BOOTSTRAP_WINDOW_MS = 86_400_000;
 const POLL_WATERMARK_OVERLAP_MS = 7_200_000;
@@ -325,11 +350,18 @@ async function tryRetrieveSpeedingVideo(rawEvent, options = {}) {
   const pollIntervalMs = Number.isFinite(options.pollIntervalMs) ? options.pollIntervalMs : 15_000;
   const skipRetrievalRequest = options.skipRetrievalRequest === true;
 
-  const vehicleId = rawEvent.asset?.id || rawEvent.vehicle?.id || null;
-  const startTime = rawEvent.startMs || rawEvent.time || rawEvent.createdAtTime;
-  const endTime = rawEvent.endMs || rawEvent.time || rawEvent.updatedAtTime || startTime;
+  // A GENUINE interval. This used to be `startTime = event.startMs || event.time`
+  // and `endTime = event.endMs || event.time`, so a speeding event reporting a
+  // single instant — most of them — asked Samsara for footage from T to T.
+  // Samsara cannot produce a clip of no duration, and the request came back
+  // empty forever. buildRetrievalWindow always widens to a real, bounded window.
+  const window = buildRetrievalWindow(rawEvent, {
+    beforeSeconds: options.windowBeforeSeconds,
+    afterSeconds: options.windowAfterSeconds,
+  });
+  if (!window) return null;
+  const { vehicleId, startTime, endTime } = window;
 
-  if (!vehicleId || !startTime || !endTime) return null;
   if (rawEvent.media?.length || rawEvent.downloadForwardVideoUrl) {
     return rawEvent.downloadForwardVideoUrl || rawEvent.media?.[0]?.url || null;
   }
@@ -447,8 +479,13 @@ async function executePoll() {
   }
   executePoll.isRunning = true;
 
+  await refreshRuntimeConfig();
+  if (!SPEEDING_ENABLED) {
+    executePoll.isRunning = false;
+    return;
+  }
   if (!SAMSARA_API_KEY) {
-    console.warn('[SpeedPoller] SAMSARA_API_KEY is not set. Cannot poll.');
+    console.warn('[SpeedPoller] No Samsara API key (admin panel or SAMSARA_API_KEY). Cannot poll.');
     executePoll.isRunning = false;
     return;
   }

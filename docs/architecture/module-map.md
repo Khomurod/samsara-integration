@@ -8,6 +8,14 @@
 >
 > This document records where each responsibility lives. It does **not** change
 > any code.
+>
+> **Operational settings live in the admin panel, not in Render.** The Samsara
+> API key, whether missing-video recovery runs, the initial re-check delay, the
+> retry behaviour and the video size cap are read from the `samsara_settings`
+> row that `bot-backend`'s Settings → Samsara writes, over the database the two
+> services already share. Every environment variable this service ever read is
+> still honoured as a per-value fallback, so a deployment that changes nothing
+> behaves exactly as before.
 
 ## Guiding principles (do not violate)
 
@@ -31,7 +39,10 @@ index.js ── Express (/health) + notification bot + send-only driverBot + pol
        ├── Polling      poller.js · speedingPoller.js · pollCoordinator.js
        ├── Delivery     broadcastDelivery.js · driverGroupDelivery.js · routing.js
        │                deliveryTracker.js · deliveryWarnings.js
-       ├── Video        safetyEventMedia.js · videoBackfill.js · videoRetryDelivery.js · videoUrl.js
+       ├── Video        safetyEventMedia.js · videoBackfill.js · videoRetryDelivery.js
+       │                cameraMediaRetrieval.js · videoUrl.js
+       ├── Recovery     videoRecoveryStore.js · videoRecoveryWorker.js
+       ├── Settings     samsaraSettings.js · sharedIntegrationCrypto.js
        ├── AI           driverAlertMessageAi.js · geminiClient.js · groqClient.js
        └── Shared       db.js · store.js · formatter.js · geocoder.js
 Shares: Postgres `groups` table + Telegram tokens with bot-backend
@@ -67,9 +78,22 @@ SIGINT/SIGTERM.
 | File | Responsibility |
 |---|---|
 | `src/safetyEventMedia.js` | Extracts forward/inward dashcam URLs; merges detail responses; refetches via fleet time-window. |
-| `src/videoBackfill.js` | After a text-only alert, resolves the video later and folds it in (send video, delete original text); in-memory `inFlight` de-dupe. |
-| `src/videoRetryDelivery.js` | Immediate send + attach backfill descriptor; retrieval/poll flow with clamped backoff. |
+| `src/videoBackfill.js` | Folds a recovered video into alerts already sent (send video, delete original text) and reports which targets it could NOT reach. Owns HOW, not WHEN. |
+| `src/videoRetryDelivery.js` | Immediate send + attach the recovery descriptor; the "ask and wait" convenience flow. The initial delay has a floor only — no ceiling. |
+| `src/cameraMediaRetrieval.js` | The Samsara camera calls, one round trip each: `buildRetrievalWindow` (never zero-length), `requestVideoRetrieval` (returns the retrieval id), `fetchRetrievalMediaUrls`, `listCameraMediaUrls`. |
 | `src/videoUrl.js` | `parseTrustedVideoUrl()`: hostname allow-list guarding every video fetch. |
+
+### Missing-video recovery (durable)
+| File | Responsibility |
+|---|---|
+| `src/videoRecoveryStore.js` | The `samsara_video_recovery_jobs` table: idempotent `enqueue` (UNIQUE event id + `ON CONFLICT DO NOTHING`), exclusive `claimDueJobs` (`FOR UPDATE SKIP LOCKED` + reclaimable stale lock), `reschedule`/`setTargets`/`finish`. |
+| `src/videoRecoveryWorker.js` | Its own interval, independent of the poll coordinator. Re-read → check an existing retrieval / the media listing → request retrieval ONCE → fold the video in → end in a state that says what happened. `enqueueVideoRecovery()` creates the job after delivery. |
+
+### Settings
+| File | Responsibility |
+|---|---|
+| `src/samsaraSettings.js` | Reads `samsara_settings` (written by the admin panel) over the shared database, with the environment as a per-value fallback. One shared, briefly-cached store for the whole process. |
+| `src/sharedIntegrationCrypto.js` | The AES-256-GCM envelope this service and `bot-backend` both open, keyed from a secret both already hold. Mirrored file — keep the two identical. |
 
 ### AI
 | File | Responsibility |
@@ -97,7 +121,11 @@ SIGINT/SIGTERM.
    sending; a `delivered` record is never downgraded; permanent failures are
    recorded and **swallowed** so an already-delivered driver group is never
    re-sent when a sibling target fails (the fix for the production duplicate bug).
-3. **Video backfill de-dupe:** in-memory `inFlight` set keyed by `eventId`.
+3. **Video recovery de-dupe:** `samsara_video_recovery_jobs.samsara_event_id` is
+   UNIQUE and `enqueue` is `ON CONFLICT DO NOTHING`, so one event can never hold
+   two recoveries — and therefore never produce two Samsara retrieval requests.
+   This replaced an in-memory `inFlight` set, which also meant a redeploy inside
+   the wait window silently dropped every pending video.
 
 > Redis (`@upstash/redis`) is used **only** for subscriber persistence, not for
 > dedupe — dedupe is Postgres-backed.
@@ -106,7 +134,12 @@ SIGINT/SIGTERM.
 - **Event retry:** delivery failure → not marked processed → re-picked next
   coordinated poll.
 - **Per-target:** only transient failures re-throw; permanent are recorded.
-- **Video retrieval:** delay clamped 30s…180s (default 60s); up to 8 polls ×15s.
+- **Missing-video recovery:** admin-configured (`samsara_settings`) — initial
+  re-check delay (default **5 minutes**), retry interval (default 5 minutes) and
+  attempt budget (default 12). The old 30s…180s clamp is gone: it silently
+  overrode the operator's chosen delay. Only a 5-second floor remains, so a
+  mis-set value cannot become a tight loop. The wait is durable, so a long one
+  costs nothing.
 - **AI:** both clients honor `retry-after` on 429/5xx then advance the model chain.
 
 ## Memory / OOM safeguards
@@ -114,7 +147,7 @@ SIGINT/SIGTERM.
 - Pollers run strictly sequentially (`pollCoordinator`) + per-poll overlap guard.
 - Bounded queues (`MAX_ALERT_QUEUE` 100/200) and seen-ID sets (500/1000);
   speeding processed-ID list capped via `.slice(-5000)`.
-- Video downloads capped by size (default 25 MB) via `content-length` + a
+- Video downloads capped by size (admin-configurable, default 25 MB) via `content-length` + a
   streaming byte counter that cancels mid-download; buffers cleared in `finally`.
 
 ## AI safety

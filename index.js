@@ -22,7 +22,9 @@ const {
 } = require('./src/deliveryWarnings');
 const { deliverEvent } = require('./src/broadcastDelivery');
 const { createDeliveryTracker, classifyTelegramError } = require('./src/deliveryTracker');
-const { scheduleVideoBackfill } = require('./src/videoBackfill');
+const { getSamsaraSettingsStore } = require('./src/samsaraSettings');
+const { createVideoRecoveryStore } = require('./src/videoRecoveryStore');
+const { createVideoRecoveryWorker, enqueueVideoRecovery } = require('./src/videoRecoveryWorker');
 const { createSafetyEventVideoStore } = require('./src/safetyEventVideoSettings');
 const { createDriverVideoProcessor } = require('./src/safetyEventVideoMusicService');
 const { buildHealthReport } = require('./src/healthReport');
@@ -33,6 +35,16 @@ const { buildHealthReport } = require('./src/healthReport');
 const HEALTH_STALE_THRESHOLD_MS = parseInt(process.env.HEALTH_STALE_THRESHOLD_MS || '300000', 10); // 5 min
 const HEALTH_STARTUP_GRACE_MS = parseInt(process.env.HEALTH_STARTUP_GRACE_MS || '120000', 10); // 2 min
 const SPEEDING_ENABLED = process.env.SAMSARA_SPEEDING_ENABLED !== 'false';
+
+// OPERATIONAL SETTINGS COME FROM THE SHARED DATABASE, written by the admin
+// panel — the API key, whether missing-video recovery runs, how long to wait
+// before looking again. Every value falls back to the environment variable this
+// service has always read, so the currently deployed configuration keeps
+// working with nothing entered and nothing migrated.
+const samsaraSettings = getSamsaraSettingsStore();
+// The DURABLE replacement for the in-memory backfill timer: a pending video
+// recovery now survives a restart or a redeploy.
+const videoRecoveryStore = createVideoRecoveryStore({ pool: samsaraDb.getPgPool(), log: console });
 
 // Durable per-(event, target) delivery ledger — the source of truth for
 // "already sent, do not send again".
@@ -45,6 +57,37 @@ const deliveryTracker = createDeliveryTracker(samsaraDb);
 // disabled / ffmpeg is unavailable.
 const safetyVideoStore = createSafetyEventVideoStore({ pool: samsaraDb.getPgPool(), log: console });
 const driverVideoProcessor = createDriverVideoProcessor({ store: safetyVideoStore, log: console });
+
+// Works the durable recovery jobs on its OWN interval. Deliberately independent
+// of the poll coordinator: a Samsara outage or a Telegram failure while
+// recovering a video must never interrupt safety-event monitoring.
+//
+// `bot` / `driverBot` are created further down; the closures below are only
+// called from a tick, long after that.
+const videoRecoveryWorker = createVideoRecoveryWorker({
+    store: videoRecoveryStore,
+    settings: samsaraSettings,
+    resolveBot: (kind) => (kind === 'driver' ? driverBot : bot),
+    // A fresh download cache per recovery — the resolved URLs are pre-signed
+    // and time-limited, so nothing is worth caching across jobs.
+    makeGetVideoBuffer: () => {
+        const cache = new Map();
+        return async (url) => {
+            if (!url) return null;
+            if (!cache.has(url)) {
+                cache.set(url, downloadVideo(url).catch((err) => {
+                    cache.delete(url);
+                    throw err;
+                }));
+            }
+            return cache.get(url);
+        };
+    },
+    // The driver group's recovered copy still gets the music overlay; the
+    // notifications group never does.
+    prepareDriverVideo: driverVideoProcessor.prepareDriverVideoBuffer,
+    log: console,
+});
 
 // The Samsara notification bot's OWN token (e.g. @wenzesambot). Prefer the
 // explicit SAMSARA_BOT_TOKEN when set — this bot is what must be a member of
@@ -100,6 +143,9 @@ app.get('/health', (req, res) => {
                 ? speedingPoller.getStatus()
                 : { enabled: SPEEDING_ENABLED },
         });
+        // Recovery is reported but NEVER affects the health verdict: a stuck
+        // video must not make an otherwise-healthy safety-event poller look dead.
+        report.body.videoRecovery = videoRecoveryWorker.getStatus();
         res.status(report.statusCode).json(report.body);
     } catch (err) {
         // /health must never throw; fall back to the legacy minimal shape.
@@ -128,7 +174,9 @@ async function downloadVideo(videoUrl) {
     const host = parsed.hostname.toLowerCase();
 
     const fetchHeaders = {};
-    const SAMSARA_API_KEY = process.env.SAMSARA_API_KEY;
+    // The effective key and size cap: admin panel first, environment second.
+    const cfg = await samsaraSettings.load();
+    const SAMSARA_API_KEY = cfg.apiKey;
     // Samsara media URLs are pre-signed CloudFront CDN URLs that embed auth in query params
     // (Signature=, Key-Pair-Id=, Expires=). Adding an Authorization header to a pre-signed
     // URL causes CloudFront/S3 to return HTTP 400 "conflicting auth methods".
@@ -150,7 +198,9 @@ async function downloadVideo(videoUrl) {
         throw new Error(`HTTP ${response.status} ${response.statusText}`);
     }
     
-    const resolvedMax = MAX_VIDEO_BYTES > 0 ? MAX_VIDEO_BYTES : 25 * 1024 * 1024;
+    const resolvedMax = MAX_VIDEO_BYTES > 0
+        ? MAX_VIDEO_BYTES
+        : Math.max(1, cfg.maxVideoMegabytes) * 1024 * 1024;
     const contentLength = Number(response.headers.get('content-length') || 0);
     if (contentLength > resolvedMax) {
         if (response.body && typeof response.body.resume === 'function') {
@@ -236,42 +286,26 @@ async function broadcast(alertData) {
         videoCache.clear();
     }
 
-    // The alert was sent immediately. If it went out without video, schedule a
-    // backfill: resolve/generate the dashcam video shortly after and post it as
-    // a reply under each original alert (notifications group + subscribers +
-    // driver group). deliverEvent throws on transient failure, so we only reach
-    // here after a clean delivery run.
-    const backfill = alertData && typeof alertData === 'object' ? alertData.videoBackfill : null;
-    if (backfill && result && !result.hadVideoAtSend && result.sentMessages?.length) {
-        scheduleVideoBackfill({
-            eventId: backfill.eventId,
-            rawEvent: backfill.rawEvent,
-            sentMessages: result.sentMessages,
-            apiKey: process.env.SAMSARA_API_KEY,
-            baseUrl: process.env.SAMSARA_API_BASE || 'https://api.samsara.com',
-            resolveBot: (kind) => (kind === 'driver' ? driverBot : bot),
-            // Each backfill uses its own short-lived download cache; the video
-            // URLs are freshly resolved (pre-signed, time-limited) at backfill time.
-            makeGetVideoBuffer: () => {
-                const cache = new Map();
-                return async (url) => {
-                    if (!url) return null;
-                    if (!cache.has(url)) {
-                        cache.set(url, downloadVideo(url).catch((err) => {
-                            cache.delete(url);
-                            throw err;
-                        }));
-                    }
-                    return cache.get(url);
-                };
-            },
-            refetchFn: backfill.refetchFn || undefined,
-            retrievalFn: backfill.retrievalFn || undefined,
-            delayMs: backfill.delayMs,
-            // Driver-group-only music overlay for the backfilled video copy.
-            prepareDriverVideo: driverVideoProcessor.prepareDriverVideoBuffer,
-            isSpeeding: Boolean(alertData && typeof alertData === 'object' && alertData.isSpeeding),
-        });
+    // The alert was sent immediately. If it went out without video, record a
+    // DURABLE recovery job — the video is folded into these very messages later
+    // by src/videoRecoveryWorker.js. Writing a row rather than arming a timer is
+    // what makes a redeploy mid-wait cost nothing. deliverEvent throws on a
+    // transient failure, so we only reach here after a clean delivery run.
+    if (result && !result.hadVideoAtSend) {
+        try {
+            await enqueueVideoRecovery({
+                store: videoRecoveryStore,
+                settings: samsaraSettings,
+                alertData,
+                result,
+                log: console,
+            });
+        } catch (err) {
+            // The alert is ALREADY delivered. Throwing here would make the queue
+            // treat this event as undelivered and broadcast it a second time —
+            // a duplicate safety alert to pay for a missing video. Never.
+            console.error('[VideoRecovery] Could not record the recovery job:', err.message);
+        }
     }
 }
 
@@ -354,6 +388,7 @@ bot.onText(/\/help/, (msg) => {
 async function start() {
     await store.init();
     await samsaraDb.initPgDb();
+    await videoRecoveryStore.ensureSchema();
     await new Promise((resolve) => {
         httpServer = app.listen(PORT, resolve);
     });
@@ -406,6 +441,11 @@ async function start() {
     // "why is there no music?" answerable from the logs alone.
     await logMusicOverlayReadiness();
 
+    // Missing-video recovery, and what it is configured to do. Logged without
+    // the key so "why is nothing being recovered?" is answerable from the log.
+    await logVideoRecoveryReadiness();
+    videoRecoveryWorker.start();
+
     // Start coordinated polling
     coordinator.start();
 }
@@ -451,6 +491,26 @@ async function logMusicOverlayReadiness() {
     }
 }
 
+/**
+ * Where this service's settings came from and what the recovery queue holds.
+ * Never prints the API key — only whether one resolved, and from where.
+ */
+async function logVideoRecoveryReadiness() {
+    const tag = '[VideoRecovery]';
+    try {
+        console.log(`${tag} Settings: ${await samsaraSettings.describe()}`);
+        const counts = await videoRecoveryStore.countsByStatus();
+        const open = (counts.pending_recheck || 0) + (counts.pending_retrieval || 0)
+            + (counts.video_available || 0);
+        console.log(
+            `${tag} Queue on boot: ${open} recovery job(s) still open`
+            + `${open ? ' — they resume now, exactly where the last process left them.' : '.'}`,
+        );
+    } catch (err) {
+        console.warn(`${tag} Readiness self-check skipped: ${err.message}`);
+    }
+}
+
 async function verifyNotificationBotAccess() {
     try {
         const me = await bot.getMe();
@@ -482,6 +542,7 @@ async function shutdown(signal) {
     isShuttingDown = true;
     console.log(`\n[App] Shutting down (${signal})...`);
     coordinator.stop();
+    videoRecoveryWorker.stop();
     if (!USE_WEBHOOK) {
         try {
             await bot.stopPolling();
