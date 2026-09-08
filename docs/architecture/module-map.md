@@ -62,7 +62,7 @@ SIGINT/SIGTERM.
 | File | Responsibility |
 |---|---|
 | `src/poller.js` | Polls `/fleet/safety-events` (cursor + time-window watermark); dedupes; formats; enqueues at 2s spacing. |
-| `src/speedingPoller.js` | Separate `/safety-events/stream` poller for speeding labels; isolated cursor/dedup state (`speed:`-namespaced IDs). |
+| `src/speedingPoller.js` | Separate `/safety-events/stream` poller for speeding labels; isolated cursor/dedup state (`speed:`-namespaced IDs). It no longer carries its own copy of the camera-retrieval calls — that was a second implementation of `cameraMediaRetrieval.js` that could not survive a restart. |
 | `src/pollCoordinator.js` | Runs the two pollers **sequentially** (safety → 15s → speeding → 15s → repeat) so they never run concurrently. |
 
 ### Delivery / routing
@@ -79,7 +79,7 @@ SIGINT/SIGTERM.
 |---|---|
 | `src/safetyEventMedia.js` | Extracts forward/inward dashcam URLs; merges detail responses; refetches via fleet time-window. |
 | `src/videoBackfill.js` | Folds a recovered video into alerts already sent (send video, delete original text) and reports which targets it could NOT reach. Owns HOW, not WHEN. |
-| `src/videoRetryDelivery.js` | Immediate send + attach the recovery descriptor; the "ask and wait" convenience flow. The initial delay has a floor only — no ceiling. |
+| `src/videoRetryDelivery.js` | Immediate send + attach the recovery descriptor. Nothing else: the camera calls moved to `cameraMediaRetrieval.js` and the pacing to the durable worker. |
 | `src/cameraMediaRetrieval.js` | The Samsara camera calls, one round trip each: `buildRetrievalWindow` (never zero-length), `requestVideoRetrieval` (returns the retrieval id), `fetchRetrievalMediaUrls`, `listCameraMediaUrls`. |
 | `src/videoUrl.js` | `parseTrustedVideoUrl()`: hostname allow-list guarding every video fetch. |
 

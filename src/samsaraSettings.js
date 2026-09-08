@@ -49,6 +49,33 @@ function envBool(name, fallback) {
   return raw !== 'false';
 }
 
+/**
+ * The environment's veto on missing-video recovery.
+ *
+ * Read synchronously and separately from `load()` because the alert path
+ * decides whether to attach a recovery descriptor while formatting, before it
+ * can await anything. It is a VETO, not the setting: `false` here disables
+ * recovery whatever the admin panel says, which is how a deployment that turned
+ * it off stays off.
+ */
+function isVideoRecoveryEnabledInEnv() {
+  return process.env.SAMSARA_VIDEO_RETRY_ENABLED !== 'false';
+}
+
+// The shipped initial delay, and a floor so a mis-set value cannot become a
+// tight loop. There is deliberately NO ceiling: the old 30s…180s clamp silently
+// overrode the operator's chosen delay, so an admin-set 5 minutes could only
+// ever be 3. The wait is durable now, so a long one costs nothing.
+const DEFAULT_INITIAL_DELAY_MS = 300_000;
+const MIN_INITIAL_DELAY_MS = 5_000;
+
+/** The environment's initial re-check delay, in ms. The database wins over it. */
+function envInitialDelayMs() {
+  const parsed = parseInt(process.env.SAMSARA_VIDEO_RETRY_DELAY_MS || String(DEFAULT_INITIAL_DELAY_MS), 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_INITIAL_DELAY_MS;
+  return Math.max(MIN_INITIAL_DELAY_MS, parsed);
+}
+
 function intOr(value, fallback) {
   const n = Number.parseInt(value, 10);
   return Number.isFinite(n) ? n : fallback;
@@ -70,11 +97,8 @@ function envConfig() {
       const bytes = intOr(process.env.SAMSARA_MAX_VIDEO_BYTES, 0);
       return bytes > 0 ? Math.max(1, Math.round(bytes / (1024 * 1024))) : DEFAULTS.maxVideoMegabytes;
     })(),
-    videoRecoveryEnabled: envBool('SAMSARA_VIDEO_RETRY_ENABLED', DEFAULTS.videoRecoveryEnabled),
-    videoRecoveryInitialDelaySeconds: (() => {
-      const ms = intOr(process.env.SAMSARA_VIDEO_RETRY_DELAY_MS, 0);
-      return ms > 0 ? Math.round(ms / 1000) : DEFAULTS.videoRecoveryInitialDelaySeconds;
-    })(),
+    videoRecoveryEnabled: isVideoRecoveryEnabledInEnv(),
+    videoRecoveryInitialDelaySeconds: Math.round(envInitialDelayMs() / 1000),
     videoRetrievalEnabled: DEFAULTS.videoRetrievalEnabled,
     videoRecoveryRetryIntervalSeconds: DEFAULTS.videoRecoveryRetryIntervalSeconds,
     videoRecoveryMaxAttempts: DEFAULTS.videoRecoveryMaxAttempts,
@@ -209,6 +233,10 @@ function loadSamsaraConfig() {
 module.exports = {
   DEFAULTS,
   DEFAULT_API_BASE,
+  DEFAULT_INITIAL_DELAY_MS,
+  MIN_INITIAL_DELAY_MS,
+  isVideoRecoveryEnabledInEnv,
+  envInitialDelayMs,
   envConfig,
   createSamsaraSettingsStore,
   getSamsaraSettingsStore,

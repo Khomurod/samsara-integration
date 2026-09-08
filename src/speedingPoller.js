@@ -12,7 +12,6 @@ const { formatAlert } = require('./formatter');
 const { reverseGeocode } = require('./geocoder');
 const { enqueueFormattedAlert } = require('./videoRetryDelivery');
 const { loadSamsaraConfig } = require('./samsaraSettings');
-const { buildRetrievalWindow } = require('./cameraMediaRetrieval');
 
 // ── The Samsara credential, base URL and the speeding switch ─────────────────
 // MUTABLE, and `executePoll` is their only writer. They start as the
@@ -343,99 +342,6 @@ async function transformV2SpeedEvent(rawEvent, options = {}) {
   };
 }
 
-async function tryRetrieveSpeedingVideo(rawEvent, options = {}) {
-  const fetchImpl = options.fetchImpl || fetch;
-  const sleepImpl = options.sleepImpl || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const maxPolls = Number.isFinite(options.maxPolls) ? options.maxPolls : 8;
-  const pollIntervalMs = Number.isFinite(options.pollIntervalMs) ? options.pollIntervalMs : 15_000;
-  const skipRetrievalRequest = options.skipRetrievalRequest === true;
-
-  // A GENUINE interval. This used to be `startTime = event.startMs || event.time`
-  // and `endTime = event.endMs || event.time`, so a speeding event reporting a
-  // single instant — most of them — asked Samsara for footage from T to T.
-  // Samsara cannot produce a clip of no duration, and the request came back
-  // empty forever. buildRetrievalWindow always widens to a real, bounded window.
-  const window = buildRetrievalWindow(rawEvent, {
-    beforeSeconds: options.windowBeforeSeconds,
-    afterSeconds: options.windowAfterSeconds,
-  });
-  if (!window) return null;
-  const { vehicleId, startTime, endTime } = window;
-
-  if (rawEvent.media?.length || rawEvent.downloadForwardVideoUrl) {
-    return rawEvent.downloadForwardVideoUrl || rawEvent.media?.[0]?.url || null;
-  }
-
-  if (!skipRetrievalRequest) {
-    try {
-      const reqRes = await fetchImpl(`${SAMSARA_API_BASE}/cameras/media/retrieval`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${SAMSARA_API_KEY}`,
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          vehicleId,
-          startTime,
-          endTime,
-          mediaType: 'videoHighRes',
-          inputs: ['dashcamRoadFacing', 'dashcamDriverFacing'],
-        }),
-      });
-
-      const reqText = await reqRes.text();
-      if (!reqRes.ok) {
-        throw new Error(`retrieval ${reqRes.status}: ${reqText.slice(0, 200)}`);
-      }
-    } catch (err) {
-      console.warn('[SpeedPoller] Media retrieval request failed:', err.message);
-      return null;
-    }
-  }
-
-  const queryStart = new Date(Date.parse(startTime) - 60_000).toISOString();
-  const queryEnd = new Date(Date.parse(endTime) + 120_000).toISOString();
-
-  for (let i = 0; i < maxPolls; i++) {
-    await sleepImpl(pollIntervalMs);
-    try {
-      const url = new URL(`${SAMSARA_API_BASE}/cameras/media`);
-      url.searchParams.append('vehicleIds', vehicleId);
-      url.searchParams.append('startTime', queryStart);
-      url.searchParams.append('endTime', queryEnd);
-      url.searchParams.append('mediaTypes', 'videoHighRes');
-      url.searchParams.append('inputs', 'dashcamRoadFacing');
-      url.searchParams.append('inputs', 'dashcamDriverFacing');
-
-      const res = await fetchImpl(url.toString(), {
-        headers: {
-          Authorization: `Bearer ${SAMSARA_API_KEY}`,
-          Accept: 'application/json',
-        },
-      });
-      const text = await res.text();
-      if (!res.ok) {
-        throw new Error(`media list ${res.status}: ${text.slice(0, 200)}`);
-      }
-      const json = text ? JSON.parse(text) : {};
-      const media = json.data?.media || [];
-      const match = media.find((row) => {
-        const mediaType = String(row.mediaType || '');
-        return /video/i.test(mediaType) && row.urlInfo?.url;
-      });
-
-      if (match?.urlInfo?.url) {
-        return match.urlInfo.url;
-      }
-    } catch (err) {
-      console.warn('[SpeedPoller] Media retrieval polling failed:', err.message);
-    }
-  }
-
-  return null;
-}
-
 async function fetchSpeedingEventsPage({ startTime, endTime, cursor }) {
   const url = new URL(`${SAMSARA_API_BASE}/safety-events/stream`);
   url.searchParams.set('startTime', startTime);
@@ -537,27 +443,13 @@ async function executePoll() {
             formatted.inwardVideoUrl = null;
           }
 
-          enqueueFormattedAlert(
-            formatted,
-            rawEvent,
-            queueAlert,
-            {
-              // First re-check after 60s without forcing retrieval.
-              refetchFn: async () => {
-                const url = await tryRetrieveSpeedingVideo(rawEvent, {
-                  skipRetrievalRequest: true,
-                  maxPolls: 1,
-                  pollIntervalMs: 0,
-                });
-                return { forwardUrl: url, inwardUrl: null };
-              },
-              // If still missing, then start retrieval job and poll for result.
-              retrievalFn: async () => {
-                const url = await tryRetrieveSpeedingVideo(rawEvent);
-                return { forwardUrl: url, inwardUrl: null };
-              },
-            },
-          );
+          // No video yet? The alert still goes out now, and a DURABLE recovery
+          // job resolves the clip later — see src/videoRecoveryWorker.js. This
+          // used to hand in its own refetch/retrieval closures, a second
+          // implementation of the camera calls that has since been consolidated
+          // into src/cameraMediaRetrieval.js and, unlike this one, survives a
+          // restart.
+          enqueueFormattedAlert(formatted, rawEvent, queueAlert);
 
           totalQueued += 1;
         } catch (eventErr) {
@@ -628,7 +520,6 @@ module.exports = {
 
   _forTest: {
     transformV2SpeedEvent,
-    tryRetrieveSpeedingVideo,
     isSpeedingLike,
     resetState() {
       ALERT_QUEUE.length = 0;

@@ -98,7 +98,6 @@ const LEGACY_TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').t
 const TOKEN = SAMSARA_BOT_TOKEN || LEGACY_TELEGRAM_BOT_TOKEN;
 const TOKEN_SOURCE = SAMSARA_BOT_TOKEN ? 'SAMSARA_BOT_TOKEN' : 'TELEGRAM_BOT_TOKEN';
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const MAX_VIDEO_BYTES = parseInt(process.env.SAMSARA_MAX_VIDEO_BYTES || '0', 10);
 const USE_WEBHOOK = process.env.USE_WEBHOOK === 'true'; // For Telegram itself, if hosted
 const PUBLIC_URL = (process.env.PUBLIC_WEBHOOK_URL || '').replace(/\/$/, '');
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || PUBLIC_URL;
@@ -198,9 +197,10 @@ async function downloadVideo(videoUrl) {
         throw new Error(`HTTP ${response.status} ${response.statusText}`);
     }
     
-    const resolvedMax = MAX_VIDEO_BYTES > 0
-        ? MAX_VIDEO_BYTES
-        : Math.max(1, cfg.maxVideoMegabytes) * 1024 * 1024;
+    // ONE source. `cfg.maxVideoMegabytes` already folds SAMSARA_MAX_VIDEO_BYTES
+    // in as its fallback (src/samsaraSettings.js → envConfig), so reading the
+    // env here as well would only let it override the admin panel.
+    const resolvedMax = Math.max(1, cfg.maxVideoMegabytes) * 1024 * 1024;
     const contentLength = Number(response.headers.get('content-length') || 0);
     if (contentLength > resolvedMax) {
         if (response.body && typeof response.body.resume === 'function') {
