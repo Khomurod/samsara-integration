@@ -93,7 +93,46 @@ test('rescheduling counts the attempt and never clears a retrieval id it was not
   const { text } = pool.queries[0];
   assert.match(text, /attempts = attempts \+ 1/);
   assert.match(text, /retrieval_id = COALESCE\(\$5, retrieval_id\)/);
+  assert.match(text, /targets = COALESCE\(\$9::jsonb, targets\)/, 'targets are untouched unless given');
   assert.match(text, /locked_at = NULL/, 'the claim is released');
+});
+
+test('"we asked" is recorded even when Samsara named no retrieval', async () => {
+  // The guard against a second request for the same footage is
+  // `retrieval_requested_at`, NOT the id: a request accepted without one, or
+  // one whose outcome is unknown, must stop the worker asking again just as
+  // firmly.
+  const pool = recordingPool([{ rows: [{ id: 1 }] }]);
+  const store = createVideoRecoveryStore({ pool, log: silentLog });
+  await store.reschedule(1, {
+    status: 'pending_retrieval', nextCheckAt: new Date(), retrievalRequested: true,
+  });
+
+  const { text, values } = pool.queries[0];
+  assert.match(text, /WHEN \$5 IS NOT NULL OR \$8 THEN COALESCE\(retrieval_requested_at, NOW\(\)\)/);
+  assert.equal(values[4], null, 'no retrieval id…');
+  assert.equal(values[7], true, '…but the ask is still on the record');
+});
+
+test('a terminal state and the delivered targets land in ONE statement', async () => {
+  // They must not be able to land separately: a status written without the
+  // cleared targets is a job that re-sends every video when its claim goes
+  // stale, and cleared targets without the status is a job that finishes twice.
+  const pool = recordingPool([{ rows: [{ id: 1 }] }]);
+  const store = createVideoRecoveryStore({ pool, log: silentLog });
+  await store.finish(1, { status: 'completed', targets: [] });
+
+  assert.equal(pool.queries.length, 1, 'one UPDATE, not two');
+  const { text, values } = pool.queries[0];
+  assert.match(text, /SET status = \$2/);
+  assert.match(text, /targets = COALESCE\(\$4::jsonb, targets\)/);
+  assert.equal(values[3], '[]');
+});
+
+test('a failed terminal write returns null, so the caller cannot mistake it for success', async () => {
+  const pool = recordingPool([new Error('connection terminated')]);
+  const store = createVideoRecoveryStore({ pool, log: silentLog });
+  assert.equal(await store.finish(1, { status: 'completed', targets: [] }), null);
 });
 
 test('a long error is trimmed to something the column and a human can hold', async () => {

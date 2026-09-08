@@ -180,6 +180,15 @@ function createVideoRecoveryStore({ pool, log = console } = {}) {
     retrievalId,
     retrievalStartTime,
     retrievalEndTime,
+    // TRUE once Samsara has been ASKED, whether or not it named a retrieval.
+    // Separate from `retrieval_id` on purpose: a request that succeeded without
+    // returning an id, or one whose outcome is unknown, must still stop the
+    // worker asking again — that is how one event ends up with several
+    // retrievals for the same seconds of video.
+    retrievalRequested = false,
+    // Written in the SAME statement as the status, so "these destinations have
+    // their video" and "this is where the job now stands" can never disagree.
+    targets = null,
   } = {}) {
     if (!pool || !jobId) return null;
     try {
@@ -191,10 +200,11 @@ function createVideoRecoveryStore({ pool, log = console } = {}) {
                 last_error = $4,
                 retrieval_id = COALESCE($5, retrieval_id),
                 retrieval_requested_at = CASE
-                  WHEN $5 IS NOT NULL AND retrieval_id IS NULL THEN NOW()
+                  WHEN $5 IS NOT NULL OR $8 THEN COALESCE(retrieval_requested_at, NOW())
                   ELSE retrieval_requested_at END,
                 retrieval_start_time = COALESCE($6, retrieval_start_time),
                 retrieval_end_time = COALESCE($7, retrieval_end_time),
+                targets = COALESCE($9::jsonb, targets),
                 locked_at = NULL,
                 updated_at = NOW()
           WHERE id = $1
@@ -202,6 +212,8 @@ function createVideoRecoveryStore({ pool, log = console } = {}) {
         [
           jobId, status, nextCheckAt || new Date(), shortError(lastError),
           retrievalId || null, retrievalStartTime || null, retrievalEndTime || null,
+          Boolean(retrievalRequested),
+          targets === null ? null : JSON.stringify(targets),
         ],
       );
       return res.rows[0] || null;
@@ -217,20 +229,23 @@ function createVideoRecoveryStore({ pool, log = console } = {}) {
    * thing an operator needs and the thing the old in-memory version could not
    * tell anyone.
    */
-  async function finish(jobId, { status, lastError = null } = {}) {
+  async function finish(jobId, { status, lastError = null, targets = null } = {}) {
     if (!pool || !jobId) return null;
     try {
       const res = await pool.query(
         `UPDATE samsara_video_recovery_jobs
             SET status = $2,
                 last_error = $3,
+                targets = COALESCE($4::jsonb, targets),
                 locked_at = NULL,
                 completed_at = NOW(),
                 updated_at = NOW()
           WHERE id = $1
           RETURNING *`,
-        [jobId, status, shortError(lastError)],
+        [jobId, status, shortError(lastError), targets === null ? null : JSON.stringify(targets)],
       );
+      // NULL means the row was not there; the caller must not read that as
+      // "recorded". A video has already been sent by the time this runs.
       return res.rows[0] || null;
     } catch (err) {
       log.error?.(`[VideoRecovery] finishing job ${jobId} failed: ${err.message}`);
@@ -248,31 +263,6 @@ function createVideoRecoveryStore({ pool, log = console } = {}) {
       );
     } catch (err) {
       log.warn?.(`[VideoRecovery] releasing job ${jobId} failed: ${err.message}`);
-    }
-  }
-
-  /**
-   * Replace the outstanding targets.
-   *
-   * Called after a fold-in that reached some destinations and not others: the
-   * ones that got their video are REMOVED, so a retry can never post a second
-   * video into a group that already has one. That is the per-target
-   * idempotency the immediate-delivery ledger gives the alert itself.
-   */
-  async function setTargets(jobId, targets) {
-    if (!pool || !jobId) return null;
-    try {
-      const res = await pool.query(
-        `UPDATE samsara_video_recovery_jobs
-            SET targets = $2::jsonb, updated_at = NOW()
-          WHERE id = $1
-          RETURNING *`,
-        [jobId, JSON.stringify(targets || [])],
-      );
-      return res.rows[0] || null;
-    } catch (err) {
-      log.error?.(`[VideoRecovery] updating targets of job ${jobId} failed: ${err.message}`);
-      return null;
     }
   }
 
@@ -309,7 +299,6 @@ function createVideoRecoveryStore({ pool, log = console } = {}) {
     enqueue,
     claimDueJobs,
     reschedule,
-    setTargets,
     finish,
     release,
     hasJob,

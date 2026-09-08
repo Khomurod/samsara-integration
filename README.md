@@ -49,7 +49,12 @@ first poll. **The alert is never held back for it.**
    truck to produce anything.
 4. **If it is still missing, footage is requested — once.** The retrieval id
    Samsara returns is stored on the job, so every later check polls **that**
-   request instead of queueing another for the same seconds of video.
+   request instead of queueing another for the same seconds of video. What
+   stops a second request is `retrieval_requested_at`, not the id: a request
+   Samsara accepted without naming one, and a request whose outcome cannot be
+   known (a timeout — it may well have landed), both mean *stop asking*. Only a
+   refusal carrying an HTTP status is proof it did not land, and only that is
+   worth re-asking, within the attempt budget.
 5. **Once the clip exists it is folded into the messages already sent** — the
    notifications group, every subscriber, **and** the matched driver group —
    each keeping its own original caption. No separate follow-up message.
@@ -65,8 +70,15 @@ first poll. **The alert is never held back for it.**
 > sent first and the delete second, so **a failed video send never loses the
 > alert** and a failed delete never loses the video. Targets that could not be
 > reached are kept on the job, so a retry goes only where the video is still
-> missing — a group that already received it can never get a second copy. The
-> driver group keeps its own (AI-rephrased) caption. Captions longer than
+> missing — a group that already received it can never get a second copy.
+>
+> The surviving targets are written in the **same statement** as the job's new
+> status, so "these destinations have their video" and "this is where the job
+> stands" cannot land separately — a retry can never re-send where a send
+> succeeded. A terminal write that does not stick is logged as an error rather
+> than reported as a completed recovery.
+>
+> The driver group keeps its own (AI-rephrased) caption. Captions longer than
 > Telegram's 1024-char media limit are truncated for the video message (the
 > standard alert is well under this).
 

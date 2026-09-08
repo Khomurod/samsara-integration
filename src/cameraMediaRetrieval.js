@@ -127,7 +127,11 @@ function pickMediaUrls(rows) {
  * @returns {Promise<{ok:boolean, retrievalId:string|null, urls:{forwardUrl,inwardUrl}}>}
  *   `retrievalId` is the thing worth persisting: with it, a later check polls
  *   THIS request instead of creating a second one for the same footage.
- * @throws on a non-2xx response, so the caller can record why and back off.
+ * @throws on a non-2xx response, carrying `err.status`. THAT DISTINCTION
+ *   MATTERS: a status means Samsara answered and refused, so the request was
+ *   definitely not accepted and asking again is safe. An error with no status —
+ *   a timeout, a reset — is ambiguous: Samsara may well have accepted it, and
+ *   asking again is how one event ends up with several retrievals.
  */
 async function requestVideoRetrieval({
   vehicleId, startTime, endTime, apiKey, baseUrl, fetchImpl = fetch,
@@ -148,7 +152,9 @@ async function requestVideoRetrieval({
   });
   const text = await res.text();
   if (!res.ok) {
-    throw new Error(`retrieval ${res.status}: ${String(text).slice(0, 200)}`);
+    const err = new Error(`retrieval ${res.status}: ${String(text).slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
   }
   let json = {};
   try { json = text ? JSON.parse(text) : {}; } catch { json = {}; }

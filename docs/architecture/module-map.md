@@ -86,7 +86,7 @@ SIGINT/SIGTERM.
 ### Missing-video recovery (durable)
 | File | Responsibility |
 |---|---|
-| `src/videoRecoveryStore.js` | The `samsara_video_recovery_jobs` table: idempotent `enqueue` (UNIQUE event id + `ON CONFLICT DO NOTHING`), exclusive `claimDueJobs` (`FOR UPDATE SKIP LOCKED` + reclaimable stale lock), `reschedule`/`setTargets`/`finish`. |
+| `src/videoRecoveryStore.js` | The `samsara_video_recovery_jobs` table: idempotent `enqueue` (UNIQUE event id + `ON CONFLICT DO NOTHING`), exclusive `claimDueJobs` (`FOR UPDATE SKIP LOCKED` + reclaimable stale lock), and `reschedule`/`finish`, which write the surviving `targets` in the SAME statement as the status so the two can never land separately. |
 | `src/videoRecoveryWorker.js` | Its own interval, independent of the poll coordinator. Re-read → check an existing retrieval / the media listing → request retrieval ONCE → fold the video in → end in a state that says what happened. `enqueueVideoRecovery()` creates the job after delivery. |
 
 ### Settings

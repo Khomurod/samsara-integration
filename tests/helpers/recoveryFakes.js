@@ -33,9 +33,9 @@ const RAW_EVENT = {
 };
 
 /** An in-memory stand-in for src/videoRecoveryStore.js, recording every call. */
-function fakeStore(initialJobs = []) {
+function fakeStore(initialJobs = [], { finishFails = false } = {}) {
   const jobs = new Map(initialJobs.map((j) => [j.id, { ...j }]));
-  const calls = { enqueue: [], reschedule: [], finish: [], setTargets: [] };
+  const calls = { enqueue: [], reschedule: [], finish: [] };
   let nextId = jobs.size + 1;
   return {
     calls,
@@ -66,6 +66,8 @@ function fakeStore(initialJobs = []) {
           && new Date(j.next_check_at) <= now,
       );
     },
+    // `targets` rides along in the SAME call as the status, mirroring the real
+    // store's single UPDATE — the two must never be able to land separately.
     async reschedule(id, patch) {
       calls.reschedule.push({ id, ...patch });
       const job = jobs.get(id);
@@ -75,19 +77,25 @@ function fakeStore(initialJobs = []) {
         attempts: (job.attempts || 0) + 1,
         last_error: patch.lastError ?? null,
         retrieval_id: patch.retrievalId || job.retrieval_id,
+        retrieval_requested_at: (patch.retrievalId || patch.retrievalRequested)
+          ? (job.retrieval_requested_at || new Date())
+          : job.retrieval_requested_at,
         retrieval_start_time: patch.retrievalStartTime || job.retrieval_start_time,
         retrieval_end_time: patch.retrievalEndTime || job.retrieval_end_time,
+        targets: patch.targets == null ? job.targets : patch.targets,
       });
       return job;
     },
-    async setTargets(id, targets) {
-      calls.setTargets.push({ id, targets });
-      jobs.get(id).targets = targets;
-      return jobs.get(id);
-    },
     async finish(id, patch) {
       calls.finish.push({ id, ...patch });
-      Object.assign(jobs.get(id), { status: patch.status, last_error: patch.lastError ?? null });
+      // `finishFails` reproduces the store swallowing a database error: it
+      // returns null, and the row stays exactly as it was.
+      if (finishFails) return null;
+      Object.assign(jobs.get(id), {
+        status: patch.status,
+        last_error: patch.lastError ?? null,
+        targets: patch.targets == null ? jobs.get(id).targets : patch.targets,
+      });
       return jobs.get(id);
     },
   };
@@ -111,7 +119,7 @@ function jobRow(overrides = {}) {
 }
 
 /** A worker with every collaborator faked. */
-function makeWorker({ store, refetch, bots = {}, config = CONFIG, buffers = {} } = {}) {
+function makeWorker({ store, refetch, bots = {}, config = CONFIG, buffers = {}, logErrors = null } = {}) {
   const sent = [];
   const deleted = [];
   const bot = {
@@ -129,7 +137,9 @@ function makeWorker({ store, refetch, bots = {}, config = CONFIG, buffers = {} }
     resolveBot: () => bot,
     makeGetVideoBuffer: () => async (url) => buffers[url] || Buffer.from('video-bytes'),
     refetchEventUrls: refetch,
-    log: silentLog,
+    log: logErrors
+      ? { log: () => {}, warn: () => {}, error: (m) => logErrors.push(String(m)) }
+      : silentLog,
   });
   return { worker, sent, deleted };
 }

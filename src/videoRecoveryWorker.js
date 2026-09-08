@@ -105,29 +105,49 @@ function createVideoRecoveryWorker({
       beforeSeconds: cfg.videoRetrievalWindowBeforeSeconds,
       afterSeconds: cfg.videoRetrievalWindowAfterSeconds,
     }) || { vehicleId: null, startTime: null, endTime: null };
-    try {
-      if (job.retrieval_id) {
+    // EACH LOOKUP CATCHES ITS OWN. A shared try meant a throw from the
+    // retrieval-status call — an expired or unknown id answers 404 — skipped
+    // the listing entirely, so a clip that WAS sitting in the camera's media
+    // would be missed on every attempt and the job would end as `no_video`
+    // with the fallback this module documents never having run.
+    let error = null;
+
+    if (job.retrieval_id) {
+      try {
         const byId = await fetchRetrievalMediaUrls({
           retrievalId: job.retrieval_id, apiKey: cfg.apiKey, baseUrl: cfg.apiBase,
         });
         if (hasUrls(byId)) return byId;
+      } catch (err) {
+        error = err.message;
+        log.warn?.(
+          `[VideoRecovery] event ${job.samsara_event_id}: retrieval ${job.retrieval_id} `
+          + `could not be read (${err.message}); falling back to the media listing`,
+        );
       }
-      if (window.vehicleId && window.startTime && window.endTime) {
+    }
+
+    if (window.vehicleId && window.startTime && window.endTime) {
+      try {
         const listed = await listCameraMediaUrls({ ...window, apiKey: cfg.apiKey, baseUrl: cfg.apiBase });
         if (hasUrls(listed)) return listed;
+      } catch (err) {
+        error = err.message;
+        log.warn?.(`[VideoRecovery] event ${job.samsara_event_id}: media listing failed: ${err.message}`);
       }
-      return { forwardUrl: null, inwardUrl: null };
-    } catch (err) {
-      log.warn?.(`[VideoRecovery] event ${job.samsara_event_id}: retrieval check failed: ${err.message}`);
-      return { forwardUrl: null, inwardUrl: null, error: err.message };
     }
+
+    return { forwardUrl: null, inwardUrl: null, error };
   }
 
   /**
    * Ask for footage — ONCE per event.
    *
-   * A job that already carries a retrieval id never gets here, which is what
-   * stops every retry becoming another request for the same seconds of video.
+   * `requested` is the answer to "must we never ask again?", and it is NOT the
+   * same question as "did we get a retrieval id". A request Samsara accepted
+   * without naming one, and a request whose outcome we cannot know (a timeout,
+   * a reset — it may well have landed), both mean stop asking. Only a refusal
+   * WITH a status is proof it did not land, and only that is worth re-asking.
    */
   async function startRetrieval(job, cfg) {
     const window = buildRetrievalWindow(job.raw_event, {
@@ -145,9 +165,17 @@ function createVideoRecoveryWorker({
         `[VideoRecovery] event ${job.samsara_event_id}: requested ${window.durationSeconds}s of footage `
         + `(${requested.retrievalId ? `retrieval ${requested.retrievalId}` : 'no retrieval id returned'})`,
       );
-      return { window, retrievalId: requested.retrievalId, urls: requested.urls };
+      return { window, requested: true, retrievalId: requested.retrievalId, urls: requested.urls };
     } catch (err) {
-      return { window, error: err.message };
+      const refused = typeof err.status === 'number';
+      if (!refused) {
+        log.warn?.(
+          `[VideoRecovery] event ${job.samsara_event_id}: the retrieval request did not complete `
+          + `(${err.message}). It may have reached Samsara, so it will not be sent again — `
+          + 'later checks poll the camera media listing instead.',
+        );
+      }
+      return { window, requested: !refused, error: err.message };
     }
   }
 
@@ -179,10 +207,40 @@ function createVideoRecoveryWorker({
     });
   }
 
+  /**
+   * Record a terminal state, and say plainly when that did not stick.
+   *
+   * The store swallows database errors, so an unchecked `finish()` let the
+   * worker report a completed recovery while the row stayed open with all of
+   * its original targets — and once the claim went stale, every destination
+   * got the video a second time. The caller acts on the answer.
+   */
+  async function finishJob(job, patch) {
+    const row = await store.finish(job.id, patch);
+    if (!row) {
+      log.error?.(
+        `[VideoRecovery] event ${job.samsara_event_id}: the video was handled but recording `
+        + `'${patch.status}' FAILED. The job stays open and will be retried once its claim goes `
+        + 'stale — check the database before that happens.',
+      );
+    }
+    return Boolean(row);
+  }
+
   /** Advance ONE job by one step. Never throws. */
   async function processJob(job, cfg) {
     const attempts = Number(job.attempts) || 0;
     const budgetSpent = attempts + 1 >= Number(cfg.videoRecoveryMaxAttempts);
+
+    // Nothing left to deliver. This is the resume path after a terminal write
+    // that did not land: the targets were cleared in the same statement as the
+    // status, so an empty list means every destination already has its video
+    // and the only thing outstanding is saying so. Finishing here costs no
+    // Samsara call and, crucially, re-sends nothing.
+    if (!(Array.isArray(job.targets) ? job.targets : []).length) {
+      await finishJob(job, { status: 'completed' });
+      return 'completed';
+    }
 
     // Step 1 — is the clip simply there now? Always worth asking first: it is
     // one cheap read and it is how most events resolve.
@@ -197,47 +255,65 @@ function createVideoRecoveryWorker({
     }
 
     // Step 3 — nothing yet, and nobody has asked for footage: ask, once.
-    if (!hasUrls(urls) && !job.retrieval_id && cfg.videoRetrievalEnabled) {
+    //
+    // `retrieval_requested_at` is the guard, not `retrieval_id`: a request that
+    // Samsara accepted without naming an id, or one whose outcome is unknown,
+    // must stop us asking again just as firmly. Guarding on the id alone meant
+    // every later attempt issued another POST for the same seconds of video.
+    const alreadyAsked = Boolean(job.retrieval_id || job.retrieval_requested_at);
+    if (!hasUrls(urls) && !alreadyAsked && cfg.videoRetrievalEnabled) {
       const started = await startRetrieval(job, cfg);
       stepError = started.error || stepError;
       if (hasUrls(started.urls)) {
         urls = started.urls;
-      } else if (started.window) {
+      } else if (started.window && !budgetSpent) {
         await store.reschedule(job.id, {
           status: 'pending_retrieval',
           nextCheckAt: secondsFromNow(cfg.videoRecoveryRetryIntervalSeconds),
           lastError: started.error || null,
           retrievalId: started.retrievalId,
+          retrievalRequested: started.requested,
           retrievalStartTime: started.window.startTime,
           retrievalEndTime: started.window.endTime,
         });
         return 'pending_retrieval';
       }
+      // Out of attempts: fall through to step 5 and end the job. This branch
+      // used to return unconditionally, so a job whose retrieval kept failing
+      // never reached the budget check and rescheduled itself forever.
     }
 
     // Step 4 — footage exists: fold it into the waiting messages.
+    //
+    // Every write below carries the surviving targets in the SAME statement as
+    // the status. That is what makes "these destinations already have their
+    // video" durable at the instant the job's state changes: the two cannot
+    // land separately, so a retry can never re-send where a send succeeded.
     if (hasUrls(urls)) {
       const result = await deliverVideo(job, urls);
       const remaining = result.failedTargets || [];
+
       if (!remaining.length) {
-        await store.finish(job.id, { status: 'completed' });
+        await finishJob(job, { status: 'completed', targets: [] });
         log.log?.(
           `[VideoRecovery] event ${job.samsara_event_id}: video folded into `
           + `${result.posted} message(s); recovery complete`,
         );
         return 'completed';
       }
-      // Some destinations still lack it. Keep only those and come back.
-      await store.setTargets(job.id, remaining);
+
       if (budgetSpent) {
-        await store.finish(job.id, {
+        await finishJob(job, {
           status: 'failed',
+          targets: remaining,
           lastError: `video found but ${remaining.length} destination(s) could not be updated`,
         });
         return 'failed';
       }
+
       await store.reschedule(job.id, {
         status: 'video_available',
+        targets: remaining,
         nextCheckAt: secondsFromNow(cfg.videoRecoveryRetryIntervalSeconds),
         lastError: result.error || `${remaining.length} destination(s) not yet updated`,
       });
@@ -246,7 +322,7 @@ function createVideoRecoveryWorker({
 
     // Step 5 — still nothing. Give up loudly, or wait a measured interval.
     if (budgetSpent) {
-      await store.finish(job.id, {
+      await finishJob(job, {
         status: 'no_video',
         lastError: stepError || 'Samsara never produced a clip for this event',
       });

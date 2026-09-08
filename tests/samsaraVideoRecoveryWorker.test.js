@@ -42,7 +42,8 @@ test('the initial re-check finds the clip and costs no camera retrieval', async 
     assert.equal(sent.length, 1);
     assert.equal(sent[0].caption, 'Harsh braking', "each target keeps its own original text");
     assert.deepEqual(deleted, [{ chatId: '-100111', messageId: 55 }], 'the text-only alert is removed after the video lands');
-    assert.deepEqual(store.calls.finish, [{ id: 1, status: 'completed' }]);
+    assert.deepEqual(store.calls.finish, [{ id: 1, status: 'completed', targets: [] }],
+      'the delivered targets are cleared in the SAME write as the status');
   } finally { fetchStub.restore(); }
 });
 
@@ -159,7 +160,7 @@ test('a failed video send leaves the original text notification intact', async (
     assert.deepEqual(deleted, [], 'nothing is deleted when the video did not land');
     assert.deepEqual(result.outcomes, [{ eventId: 'evt-1', outcome: 'video_available' }]);
     // The destination is kept so the retry goes exactly where it is still missing.
-    assert.equal(store.calls.setTargets[0].targets.length, 1);
+    assert.equal(store.calls.reschedule[0].targets.length, 1);
   } finally { fetchStub.restore(); }
 });
 
@@ -195,7 +196,7 @@ test('a partial fold-in retries only the destination that missed out', async () 
     await worker.tick();
     assert.equal(calls, 2);
     assert.deepEqual(
-      store.calls.setTargets[0].targets.map((t) => t.chatId),
+      store.calls.reschedule[0].targets.map((t) => t.chatId),
       ['-100222'],
       'the group that already has the video is never targeted again',
     );
@@ -293,5 +294,111 @@ test('the event time anchors the retrieval window, not the moment we happened to
       Date.parse(post.body.endTime) > Date.parse(RAW_EVENT.time),
       'and closes after it',
     );
+  } finally { fetchStub.restore(); }
+});
+
+// ── the three holes the Codex review found on the first pass ──
+
+test('a retrieval Samsara never answered is not asked for again, and still ends', async () => {
+  // The original bug, twice over: `startRetrieval` returns a window even when
+  // the POST failed, so this branch rescheduled unconditionally — never
+  // reaching the attempt budget — and, because no retrieval id was stored,
+  // every later attempt issued ANOTHER POST for the same seconds of video.
+  const store = fakeStore([jobRow()]);
+  const fetchStub = stubFetch(() => ({ ok: false, status: 500, body: 'upstream unavailable' }));
+  try {
+    const { worker } = makeWorker({ store, refetch: NO_VIDEO, config: { ...CONFIG, videoRecoveryMaxAttempts: 2 } });
+
+    // Attempt 1: the ask is refused with a status, so it is safe to ask again.
+    await worker.tick();
+    assert.equal(store.jobs.get(1).status, 'pending_retrieval');
+    assert.equal(store.jobs.get(1).retrieval_id, null);
+
+    // Attempt 2 exhausts the budget — the job ENDS instead of looping forever.
+    store.jobs.get(1).next_check_at = new Date(Date.now() - 1000);
+    const result = await worker.tick();
+    assert.deepEqual(result.outcomes, [{ eventId: 'evt-1', outcome: 'no_video' }]);
+    assert.equal(store.calls.finish.at(-1).status, 'no_video');
+    assert.ok(store.calls.finish.at(-1).lastError, 'and it says why');
+  } finally { fetchStub.restore(); }
+});
+
+test('an ask whose outcome is unknown is never repeated', async () => {
+  // A timeout or a reset: Samsara may well have accepted the request. Asking
+  // again is how one event ends up with several retrievals, so the job records
+  // that it asked and falls back to polling the media listing.
+  const store = fakeStore([jobRow()]);
+  const fetchStub = stubFetch((req) => {
+    if (req.method === 'POST') throw new Error('ETIMEDOUT');  // no status: ambiguous
+    return { body: { data: { media: [] } } };
+  });
+  try {
+    const { worker } = makeWorker({ store, refetch: NO_VIDEO });
+
+    await worker.tick();
+    assert.equal(store.calls.reschedule[0].retrievalRequested, true);
+    assert.ok(store.jobs.get(1).retrieval_requested_at, 'the ask is recorded even with no id');
+
+    store.jobs.get(1).next_check_at = new Date(Date.now() - 1000);
+    const before = fetchStub.requests.filter((r) => r.method === 'POST').length;
+    await worker.tick();
+    assert.equal(
+      fetchStub.requests.filter((r) => r.method === 'POST').length,
+      before,
+      'no second retrieval request for the same footage',
+    );
+  } finally { fetchStub.restore(); }
+});
+
+test('an unreadable retrieval id still falls through to the media listing', async () => {
+  // An expired or unknown retrieval answers 404. A shared try/catch made that
+  // throw skip the listing entirely, so a clip already sitting in the camera's
+  // media was missed on every attempt and the job ended as `no_video`.
+  const store = fakeStore([jobRow({
+    status: 'pending_retrieval', retrieval_id: 'ret-gone', attempts: 1,
+    retrieval_start_time: '2026-05-29T14:56:17.338Z',
+    retrieval_end_time: '2026-05-29T14:57:17.338Z',
+  })]);
+  const fetchStub = stubFetch((req) => {
+    if (req.url.includes('retrievalId=')) return { ok: false, status: 404, body: 'no such retrieval' };
+    return {
+      body: { data: { media: [{ mediaType: 'videoHighRes', input: 'dashcamRoadFacing', urlInfo: { url: 'https://cdn/found.mp4' } }] } },
+    };
+  });
+  try {
+    const { worker, sent } = makeWorker({ store, refetch: NO_VIDEO });
+    const result = await worker.tick();
+
+    assert.deepEqual(result.outcomes, [{ eventId: 'evt-1', outcome: 'completed' }]);
+    assert.equal(sent.length, 1, 'the clip the listing had is delivered, not lost');
+  } finally { fetchStub.restore(); }
+});
+
+test('a terminal write that does not land never reports success, and cannot duplicate', async () => {
+  // The store swallows database errors, so an unchecked `finish()` let the
+  // worker claim a completed recovery while the row stayed open with all of
+  // its targets — and once the claim went stale, every destination got the
+  // video a second time.
+  const store = fakeStore([jobRow()], { finishFails: true });
+  const fetchStub = stubFetch(() => ({ body: {} }));
+  const errors = [];
+  try {
+    const { worker, sent } = makeWorker({
+      store,
+      refetch: async () => ({ forwardUrl: 'https://cdn/f.mp4', inwardUrl: null }),
+      logErrors: errors,
+    });
+    await worker.tick();
+
+    assert.equal(sent.length, 1, 'the video did go out');
+    assert.match(errors.join(' '), /recording 'completed' FAILED/, 'and the failure to record it is loud');
+
+    // The reclaim: the row still says pending, but its targets were to be
+    // cleared in the same statement — so nothing is re-sent either way.
+    store.jobs.get(1).targets = [];
+    store.jobs.get(1).next_check_at = new Date(Date.now() - 1000);
+    const again = await worker.tick();
+    assert.deepEqual(again.outcomes, [{ eventId: 'evt-1', outcome: 'completed' }]);
+    assert.equal(sent.length, 1, 'no destination receives the video twice');
   } finally { fetchStub.restore(); }
 });
