@@ -62,9 +62,45 @@ function resolveGroupByUnitAndName(candidates, unitNumber, nameHints = []) {
  * @returns {{group: object|null, matchReason: string|null, finding: object|null}}
  */
 function chooseRoutedGroup({
-  stored = null, parsed = null, vehicleId = null, vehicleName = '', unitNumber = null,
+  stored = null, parsed = null, contestedStored = null,
+  vehicleId = null, vehicleName = '', unitNumber = null,
 } = {}) {
   const subjectId = vehicleId ? String(vehicleId) : `unit:${unitNumber || 'unknown'}`;
+
+  // A VEHICLE TWO GROUPS BOTH CLAIM IS NOT A MISSING LINK, and the difference
+  // matters: falling silently back to the name parse would hide a contradiction
+  // in the one column meant to settle which truck a driver is in, and route a
+  // safety alert through the parser this whole change exists to demote.
+  //
+  // It should not be reachable — bot-backend refuses to write a link a second
+  // group already holds — but the two services deploy independently, so this
+  // poller can be running against a database whose bot-backend predates that
+  // rule. Detecting what should be impossible is the point of the exercise.
+  if (Array.isArray(contestedStored) && contestedStored.length > 1) {
+    return {
+      // Still routed by the parse when it resolved: an alert that reaches a
+      // plausible driver beats one that reaches nobody, and the finding says
+      // loudly that the stored column cannot be trusted for this vehicle.
+      group: parsed || null,
+      matchReason: parsed ? (parsed.matchReason || 'unit') : null,
+      finding: {
+        checkKey: 'integrations.samsara_vehicle_link_contested',
+        subjectType: 'samsara_vehicle',
+        subjectId,
+        title: `Samsara vehicle ${subjectId} is claimed by ${contestedStored.length} active driver groups`,
+        severity: 'serious',
+        evidence: {
+          vehicleId: vehicleId || null,
+          vehicleName: vehicleName || null,
+          unitNumber: unitNumber || null,
+          claimingGroups: contestedStored.map((g) => ({ id: g.id, name: g.group_name || null })),
+          parsedGroupId: parsed?.id ?? null,
+          parsedGroupName: parsed?.group_name || null,
+          routedTo: parsed ? 'parsed' : 'nobody',
+        },
+      },
+    };
+  }
 
   if (stored && parsed && String(stored.id) !== String(parsed.id)) {
     return {

@@ -190,11 +190,16 @@ module.exports = {
       // `serious` finding on day one instead of a driver who quietly stops
       // receiving safety alerts. It is one extra indexed lookup on a table of a
       // few hundred rows, per safety event.
-      const stored = await findGroupByVehicleId(vehicleId);
+      const claims = await findGroupsByVehicleId(vehicleId);
       const parsed = await findGroupByNameParse(unitNumber, driverName, vehicleName);
 
       const choice = chooseRoutedGroup({
-        stored, parsed, vehicleId, vehicleName, unitNumber,
+        stored: claims.length === 1 ? claims[0] : null,
+        contestedStored: claims.length > 1 ? claims : null,
+        parsed,
+        vehicleId,
+        vehicleName,
+        unitNumber,
       });
       if (choice.finding) {
         await recordRoutingFinding(sharedPgPool, choice.finding);
@@ -214,26 +219,30 @@ module.exports = {
 };
 
 /**
- * The stored association: `groups.samsara_vehicle_id`, written by bot-backend's
- * duplicate-unit scan only when the resolution is unambiguous in both
- * directions. Returns null rather than a guess when two groups somehow claim the
- * same vehicle — that contradiction belongs in a finding, not in a routing
- * decision made at alert time.
+ * Every active driver group claiming this vehicle — usually none or one.
+ *
+ * `groups.samsara_vehicle_id` is written by bot-backend's duplicate-unit scan
+ * only when the resolution is unambiguous in both directions, so two claimants
+ * should not be reachable. ALL of them are returned anyway, rather than
+ * collapsing to null, because "two groups claim this truck" and "no group claims
+ * this truck" are opposite facts and only one of them is worth waking somebody
+ * over. `chooseRoutedGroup` turns the first into a `serious` finding; collapsing
+ * them here would have hidden it behind a silent fallback to the name parse.
  */
-async function findGroupByVehicleId(vehicleId) {
+async function findGroupsByVehicleId(vehicleId) {
   const id = String(vehicleId || '').trim();
-  if (!id) return null;
+  if (!id) return [];
 
   const res = await sharedPgPool.query(
     `SELECT id, telegram_group_id, group_name
      FROM groups
      WHERE samsara_vehicle_id = $1
        AND group_type = 'driver'
-       AND active = TRUE`,
+       AND active = TRUE
+     ORDER BY id ASC`,
     [id]
   );
-  if (res.rows.length !== 1) return null;
-  return res.rows[0];
+  return res.rows;
 }
 
 /** The parse that has always run. Unchanged, and now the fallback. */

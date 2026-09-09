@@ -124,3 +124,43 @@ test('the legacy second router is gone', () => {
   assert.equal(typeof db.findGroupByUnit, 'undefined',
     'it had no active filter, no name check, and ORDER BY id DESC LIMIT 1 as its tiebreak');
 });
+
+// ─── a contradiction is not a missing link ───────────────────────────────────
+
+test('TWO groups claiming one vehicle is a serious finding, not a silent fallback', () => {
+  // bot-backend refuses to write a link a second group already holds, so this
+  // should be unreachable — but the two services deploy independently, and this
+  // poller can be running against a database whose bot-backend predates that
+  // rule. Collapsing it to "no stored link" would hide a contradiction in the
+  // one column meant to settle which truck a driver is in.
+  const claimants = [
+    { id: 7, telegram_group_id: '-700', group_name: 'WENZE UNIT # 305 JOHN DOE' },
+    { id: 8, telegram_group_id: '-800', group_name: 'WENZE UNIT # 305 JANE ROE' },
+  ];
+  const choice = chooseRoutedGroup({
+    contestedStored: claimants, parsed: PARSED, vehicleId: 'veh_1', unitNumber: '305',
+  });
+
+  assert.equal(choice.finding.checkKey, 'integrations.samsara_vehicle_link_contested');
+  assert.equal(choice.finding.severity, 'serious');
+  assert.deepEqual(choice.finding.evidence.claimingGroups.map((g) => g.id), [7, 8]);
+  assert.equal(choice.group, PARSED,
+    'and the alert still reaches a plausible driver — one that reaches nobody is worse');
+  assert.equal(choice.finding.evidence.routedTo, 'parsed');
+});
+
+test('a contested vehicle with no usable parse routes to NOBODY, loudly', () => {
+  const choice = chooseRoutedGroup({
+    contestedStored: [{ id: 7 }, { id: 8 }], parsed: null, vehicleId: 'veh_1',
+  });
+  assert.equal(choice.group, null);
+  assert.equal(choice.finding.severity, 'serious');
+  assert.equal(choice.finding.evidence.routedTo, 'nobody');
+});
+
+test('one claimant is an ordinary stored link, not a contradiction', () => {
+  const choice = chooseRoutedGroup({ stored: STORED, contestedStored: null, vehicleId: 'veh_1' });
+  assert.equal(choice.group, STORED);
+  assert.equal(choice.matchReason, 'vehicle_id');
+  assert.equal(choice.finding, null);
+});

@@ -164,8 +164,15 @@ SIGINT/SIGTERM.
    own is now enough to continue: the stored link can answer a label that carries
    no digits at all, and returning early meant that link was never read.
 2. **Stored link first.** `groups.samsara_vehicle_id = <vehicleId>`, driver type,
-   active — and exactly one row, because two groups claiming one vehicle is a
-   contradiction to report, not a routing decision to make at alert time.
+   active. ALL claimants are returned, not just a unique one: "two groups claim
+   this truck" and "no group claims this truck" are opposite facts, and only one
+   of them is worth waking somebody over. A contested vehicle files a `serious`
+   finding (`integrations.samsara_vehicle_link_contested`) and routes by the
+   parse if it resolved — an alert reaching a plausible driver beats one
+   reaching nobody, and the finding says loudly that the column cannot be
+   trusted for that vehicle. bot-backend refuses to write a link a second group
+   already holds, so this should be unreachable; the two services deploy
+   independently, which is exactly why it is checked.
 3. **The name parse still runs anyway**, alongside it: `groups` where
    `group_type='driver' AND active=TRUE` and the name contains the unit,
    duplicates disambiguated by **name hints** (driver + vehicle name).
