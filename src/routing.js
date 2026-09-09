@@ -32,13 +32,137 @@ function resolveGroupByUnitAndName(candidates, unitNumber, nameHints = []) {
   }) || null;
 }
 
+
+/**
+ * Which resolution wins, and what that says about the fleet's data. PURE.
+ *
+ * Until now a Samsara safety alert found its driver by pulling the first number
+ * out of a free-form vehicle label and matching it against the first number in a
+ * Telegram chat title. That works until a label reads "2021 Freightliner 305",
+ * at which point the alert routes as unit 2021 — to nobody. `groups` has carried
+ * an indexed `samsara_vehicle_id` column all along, and nothing ever wrote to it.
+ *
+ * Now something does (bot-backend's duplicate-unit scan), so this prefers the
+ * stored association and keeps the string parse underneath it. The parse is not
+ * removed, because a fleet whose links are half-written still has to route.
+ *
+ * THE FINDINGS ARE THE POINT OF DOING IT THIS WAY. A silent switchover is a
+ * switchover nobody can audit:
+ *
+ *   - the two agree            → nothing to say
+ *   - only the parse resolved  → an `info` finding naming the group it chose,
+ *                                so "how much of the fleet still routes by
+ *                                string" is a number instead of a feeling
+ *   - they disagree            → a `serious` finding. One of the two is sending
+ *                                a safety alert to the wrong driver, and which
+ *                                one is not for this function to decide. The
+ *                                stored id wins because it is the explicit
+ *                                fact, and the finding preserves the other.
+ *
+ * @returns {{group: object|null, matchReason: string|null, finding: object|null}}
+ */
+function chooseRoutedGroup({
+  stored = null, parsed = null, contestedStored = null,
+  vehicleId = null, vehicleName = '', unitNumber = null,
+} = {}) {
+  const subjectId = vehicleId ? String(vehicleId) : `unit:${unitNumber || 'unknown'}`;
+
+  // A VEHICLE TWO GROUPS BOTH CLAIM IS NOT A MISSING LINK, and the difference
+  // matters: falling silently back to the name parse would hide a contradiction
+  // in the one column meant to settle which truck a driver is in, and route a
+  // safety alert through the parser this whole change exists to demote.
+  //
+  // It should not be reachable — bot-backend refuses to write a link a second
+  // group already holds — but the two services deploy independently, so this
+  // poller can be running against a database whose bot-backend predates that
+  // rule. Detecting what should be impossible is the point of the exercise.
+  if (Array.isArray(contestedStored) && contestedStored.length > 1) {
+    return {
+      // Still routed by the parse when it resolved: an alert that reaches a
+      // plausible driver beats one that reaches nobody, and the finding says
+      // loudly that the stored column cannot be trusted for this vehicle.
+      group: parsed || null,
+      matchReason: parsed ? (parsed.matchReason || 'unit') : null,
+      finding: {
+        checkKey: 'integrations.samsara_vehicle_link_contested',
+        subjectType: 'samsara_vehicle',
+        subjectId,
+        title: `Samsara vehicle ${subjectId} is claimed by ${contestedStored.length} active driver groups`,
+        severity: 'serious',
+        evidence: {
+          vehicleId: vehicleId || null,
+          vehicleName: vehicleName || null,
+          unitNumber: unitNumber || null,
+          claimingGroups: contestedStored.map((g) => ({ id: g.id, name: g.group_name || null })),
+          parsedGroupId: parsed?.id ?? null,
+          parsedGroupName: parsed?.group_name || null,
+          routedTo: parsed ? 'parsed' : 'nobody',
+        },
+      },
+    };
+  }
+
+  if (stored && parsed && String(stored.id) !== String(parsed.id)) {
+    return {
+      group: stored,
+      matchReason: 'vehicle_id',
+      finding: {
+        checkKey: 'integrations.samsara_routing_disagreement',
+        subjectType: 'samsara_vehicle',
+        subjectId,
+        title: `Samsara vehicle ${subjectId} routes to a different driver by stored id than by name`,
+        severity: 'serious',
+        evidence: {
+          vehicleId: vehicleId || null,
+          vehicleName: vehicleName || null,
+          unitNumber: unitNumber || null,
+          storedGroupId: stored.id,
+          storedGroupName: stored.group_name || null,
+          parsedGroupId: parsed.id,
+          parsedGroupName: parsed.group_name || null,
+          routedTo: 'stored',
+        },
+      },
+    };
+  }
+
+  if (stored) return { group: stored, matchReason: 'vehicle_id', finding: null };
+
+  if (parsed) {
+    return {
+      group: parsed,
+      matchReason: parsed.matchReason || 'unit',
+      finding: {
+        checkKey: 'integrations.samsara_routed_by_name',
+        subjectType: 'samsara_vehicle',
+        subjectId,
+        title: `Samsara vehicle ${subjectId} has no stored group link — routed by parsing its label`,
+        severity: 'info',
+        evidence: {
+          vehicleId: vehicleId || null,
+          vehicleName: vehicleName || null,
+          unitNumber: unitNumber || null,
+          parsedGroupId: parsed.id,
+          parsedGroupName: parsed.group_name || null,
+          matchReason: parsed.matchReason || 'unit',
+        },
+      },
+    };
+  }
+
+  return { group: null, matchReason: null, finding: null };
+}
+
 async function determineTargetGroup(alertData, resolveGroupByUnit, managementGroupId) {
   const vehicleName = String(alertData?.vehicleName || '');
   const driverName = String(alertData?.driverName || '');
   const vehicleId = String(alertData?.vehicleId || '');
   const unitNumber = extractUnitNumber(vehicleName);
 
-  if (!unitNumber) {
+  // A vehicle id is enough on its own now. It did not used to be, so a label
+  // carrying no digits at all ended the resolution here — with a stored link
+  // sitting in the database, unread, that would have answered it.
+  if (!unitNumber && !vehicleId) {
     return {
       targetGroupId: null,
       unitNumber: null,
@@ -47,11 +171,11 @@ async function determineTargetGroup(alertData, resolveGroupByUnit, managementGro
     };
   }
 
-  const resolved = await resolveGroupByUnit(unitNumber, driverName, vehicleName);
+  const resolved = await resolveGroupByUnit(unitNumber, driverName, vehicleName, vehicleId);
   if (!resolved?.telegramGroupId) {
     return {
       targetGroupId: null,
-      unitNumber,
+      unitNumber: unitNumber || null,
       vehicleId,
       matchReason: 'fallback-unmapped',
     };
@@ -59,7 +183,7 @@ async function determineTargetGroup(alertData, resolveGroupByUnit, managementGro
 
   return {
     targetGroupId: resolved.telegramGroupId,
-    unitNumber,
+    unitNumber: unitNumber || null,
     vehicleId,
     matchReason: resolved.matchReason || 'unit',
     groupName: resolved.groupName,
@@ -67,6 +191,7 @@ async function determineTargetGroup(alertData, resolveGroupByUnit, managementGro
 }
 
 module.exports = {
+  chooseRoutedGroup,
   extractUnitNumber,
   normalizeName,
   resolveGroupByUnitAndName,

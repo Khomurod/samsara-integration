@@ -42,10 +42,31 @@ test('unmapped vehicle does not route to fallback group', async () => {
 });
 
 
-test('missing unit does not route to fallback group', async () => {
+test('a label with no unit is still resolved when a vehicle id exists', async () => {
+  // It used to return before consulting the resolver at all. A stored
+  // `samsara_vehicle_id` answers a label like "Unknown Unit" perfectly well, and
+  // returning early meant that link was never read. What must not change is the
+  // part that matters: an unresolved alert still routes to NOBODY rather than
+  // to the management group, and both `matchReason` values keep the `fallback`
+  // prefix its two consumers test for.
+  const asked = [];
   const target = await determineTargetGroup(
     { vehicleId: 'veh_unknown', vehicleName: 'Unknown Unit', driverName: 'UNKNOWN' },
-    async () => null,
+    async (...args) => { asked.push(args); return null; },
+    '-100999'
+  );
+
+  assert.equal(target.targetGroupId, null);
+  assert.equal(target.matchReason, 'fallback-unmapped');
+  assert.equal(asked.length, 1, 'the resolver is consulted on the vehicle id alone');
+  assert.equal(asked[0][3], 'veh_unknown', 'and the vehicle id reaches it');
+  assert.ok(target.matchReason.startsWith('fallback'));
+});
+
+test('no unit and no vehicle id is still nothing to resolve', async () => {
+  const target = await determineTargetGroup(
+    { vehicleName: 'Unknown Unit', driverName: 'UNKNOWN' },
+    async () => { throw new Error('the resolver must not be called'); },
     '-100999'
   );
 

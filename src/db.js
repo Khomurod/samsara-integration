@@ -225,47 +225,6 @@ module.exports = {
         }
     },
 
-    /**
-     * EXTENSION: Postgres Group Lookup
-     *
-     * Reuses the module-level `pgPool` instead of spinning up (and tearing
-     * down) a brand-new Pool on every call. Creating + ending a pool per
-     * lookup leaks connections under load and slows Samsara event routing
-     * significantly.
-     */
-    async findGroupByUnit(unitNumber) {
-        if (!unitNumber) return null;
-        if (!pgPool) {
-            console.warn('[DB] DATABASE_URL not set — cannot perform dynamic group lookup.');
-            return null;
-        }
-
-        try {
-            const query = `
-                SELECT telegram_group_id, group_name
-                FROM groups
-                WHERE group_type = 'driver'
-                AND group_name ~* $1
-                ORDER BY id DESC LIMIT 1
-            `;
-            const cleanUnit = String(unitNumber).replace(/\D/g, '');
-            if (!cleanUnit) return null;
-            const regexPattern = `#\\s*${cleanUnit}\\y`;
-            const res = await pgPool.query(query, [regexPattern]);
-
-            if (res.rows.length > 0) {
-                console.log(`[DB] Resolved Unit #${cleanUnit} to group: ${res.rows[0].group_name} (${res.rows[0].telegram_group_id})`);
-                return res.rows[0].telegram_group_id;
-            }
-
-            console.log(`[DB] No specific group found for Unit #${cleanUnit}`);
-            return null;
-        } catch (err) {
-            console.error('[DB] Postgres lookup error:', err.message);
-            return null;
-        }
-    },
-
     async initPgDb() {
         if (pgPool) {
             try {
