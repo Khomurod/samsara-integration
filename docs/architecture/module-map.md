@@ -70,7 +70,8 @@ SIGINT/SIGTERM.
 |---|---|
 | `src/broadcastDelivery.js` | `deliverEvent()`: idempotent fan-out to subscribers + notifications group + matched driver group; consults/records the ledger; only re-throws on transient failure. |
 | `src/driverGroupDelivery.js` | Sends to a driver group with dual-camera → single-video → text fallback. |
-| `src/routing.js` | Unit-number extraction + name-hint matching → target driver group or `fallback-*` reason. |
+| `src/routing.js` | Unit-number extraction + name-hint matching, and `chooseRoutedGroup()` — the pure decision between a **stored** `groups.samsara_vehicle_id` link and a parsed one → target driver group or `fallback-*` reason. |
+| `src/routingFindings.js` | Writes one `operational_findings` row (bot-backend's table, shared database) when routing fell back to the string parse, or when the two answers disagreed. Never throws, degrades silently if the table is absent, always tier `warning` — this service may report, never correct. |
 | `src/deliveryTracker.js` | Thin ledger wrapper + `classifyTelegramError()` (permanent vs transient). |
 | `src/deliveryWarnings.js` | Appends a "driver bot not in group" note to notification messages. |
 
@@ -105,8 +106,8 @@ SIGINT/SIGTERM.
 ### Shared infrastructure
 | File | Responsibility |
 |---|---|
-| `src/db.js` | Postgres pool + cursor storage; processed-events dedupe table; poll watermark; per-target delivery ledger; `findGroupByUnit`. |
-| `src/store.js` | Subscriber storage (Upstash Redis or local JSON fallback) + `findGroupByUnit()` with name-hint resolution against `groups`. |
+| `src/db.js` | Postgres pool + cursor storage; processed-events dedupe table; poll watermark; per-target delivery ledger. (It carried a second, legacy `findGroupByUnit` with no `active` filter, no name check and `ORDER BY id DESC LIMIT 1` as its tiebreak. It had no callers and is deleted; `store.js` is the one router.) |
+| `src/store.js` | Subscriber storage (Upstash Redis or local JSON fallback) + `findGroupByUnit()`: runs the stored-id lookup **and** the name parse, prefers the stored link, files a finding whenever the parse was the one that answered. |
 | `src/formatter.js` | Raw Samsara payload → human-readable HTML Telegram message. |
 | `src/geocoder.js` | Reverse-geocode lat/lon → "City, State" (BigDataCloud) when Samsara omits an address. |
 
@@ -158,20 +159,41 @@ SIGINT/SIGTERM.
 - Any thrown AI error falls back to the standard text (`broadcastDelivery.js`).
 
 ## Event → driver group routing & the notifications group
-1. Extract the **unit number** from the vehicle name; none → `fallback-no-unit`,
-   driver forward skipped.
-2. Look up `groups` where `group_type='driver' AND active=TRUE` and the name
-   contains the unit.
-3. Disambiguate duplicates by **name hints** (driver + vehicle name).
-4. No mapped group → `fallback-unmapped`, driver forward skipped (never sent to
+1. Extract the **unit number** from the vehicle name. Neither a unit number nor
+   a `vehicleId` → `fallback-no-unit`, driver forward skipped. A vehicleId on its
+   own is now enough to continue: the stored link can answer a label that carries
+   no digits at all, and returning early meant that link was never read.
+2. **Stored link first.** `groups.samsara_vehicle_id = <vehicleId>`, driver type,
+   active — and exactly one row, because two groups claiming one vehicle is a
+   contradiction to report, not a routing decision to make at alert time.
+3. **The name parse still runs anyway**, alongside it: `groups` where
+   `group_type='driver' AND active=TRUE` and the name contains the unit,
+   duplicates disambiguated by **name hints** (driver + vehicle name).
+4. `chooseRoutedGroup()` decides. The stored link wins. Then:
+   - both agree, or only the stored link resolved → nothing filed;
+   - only the parse resolved → an `info` finding
+     (`integrations.samsara_routed_by_name`), so "how much of the fleet still
+     routes by string" is a number rather than a feeling;
+   - they **disagree** → a `serious` finding
+     (`integrations.samsara_routing_disagreement`) carrying both answers. One of
+     the two is sending a safety alert to the wrong driver. Running the old path
+     alongside the new one is the only reason that surfaces on day one instead of
+     as a driver who quietly stops receiving alerts.
+5. No mapped group → `fallback-unmapped`, driver forward skipped (never sent to
    a wrong group). Matched → forwarded with an AI-friendly caption.
+
+The string parse is deliberately **not** removed. `groups.samsara_vehicle_id` is
+NULL on every production row until bot-backend's duplicate-unit scan has run, and
+that scan only writes a link when it is unambiguous in both directions — so a
+large part of the fleet will keep routing by name for a while, and must.
 
 The **"Samsara Notifications" group** is a fixed chat (`HARDCODED_GROUP_ID`) and
 is always included so every event lands there regardless of routing.
 `verifyNotificationBotAccess()` self-checks membership at startup.
 
-## Tests (`npm test` → `node --test --test-concurrency=1 tests/*.test.js`, 71 tests)
+## Tests (`npm test` → `node --test --test-concurrency=1 tests/*.test.js`, 176 tests)
 `samsaraIdempotentDelivery` · `samsaraBroadcastDelivery` · `samsaraRouting` ·
+`samsaraStoredVehicleRouting` ·
 `samsaraDriverAlertMessageAi` · `samsaraVideoBackfill` · `samsaraVideoRetryDelivery` ·
 `samsaraSpeedingPoller` · `safetyEventMedia` · `samsaraVideoUrl`.
 (Root `test-*.js` are manual live/mock scripts, **not** part of `npm test`.)

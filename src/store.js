@@ -10,7 +10,10 @@
 
 const fs = require('fs');
 const path = require('path');
-const { extractUnitNumber, normalizeName, resolveGroupByUnitAndName } = require('./routing');
+const {
+  extractUnitNumber, normalizeName, resolveGroupByUnitAndName, chooseRoutedGroup,
+} = require('./routing');
+const { recordRoutingFinding } = require('./routingFindings');
 
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -166,42 +169,42 @@ module.exports = {
   },
 
   /**
-   * Resolve Driver Group by unit number and optional name hints.
-   * Returns matched group object or null when not found.
+   * Resolve the driver group for a Samsara vehicle.
+   *
+   * Prefers the stored `groups.samsara_vehicle_id` link and keeps the unit-number
+   * parse as the fallback; see `chooseRoutedGroup` in routing.js for which wins
+   * and what gets reported. Returns the matched group or null — never a guess,
+   * and never the management group.
    */
-  async findGroupByUnit(unitNumber, driverName, vehicleName) {
-    if (!unitNumber) return null;
+  async findGroupByUnit(unitNumber, driverName, vehicleName, vehicleId = null) {
+    if (!unitNumber && !vehicleId) return null;
     if (!sharedPgPool) {
       console.warn('[Store] DATABASE_URL not set — cannot resolve unit group.');
       return null;
     }
 
     try {
-      const cleanUnit = String(unitNumber).replace(/\D/g, '');
-      if (!cleanUnit) return null;
+      // BOTH resolutions run, even though only one can win. The stored link is
+      // new and the string parse is what has been routing alerts for a year;
+      // running the old one alongside the new one is how a wrong link becomes a
+      // `serious` finding on day one instead of a driver who quietly stops
+      // receiving safety alerts. It is one extra indexed lookup on a table of a
+      // few hundred rows, per safety event.
+      const stored = await findGroupByVehicleId(vehicleId);
+      const parsed = await findGroupByNameParse(unitNumber, driverName, vehicleName);
 
-      const query = `
-        SELECT id, telegram_group_id, group_name
-        FROM groups
-        WHERE group_type = 'driver'
-          AND active = TRUE
-          AND group_name ILIKE $1
-        ORDER BY id DESC
-      `;
-      const res = await sharedPgPool.query(query, [`%${cleanUnit}%`]);
-      const nameHints = [driverName, vehicleName]
-        .map(normalizeName)
-        .filter(Boolean);
-      const fallbackNameHint = normalizeName(String(vehicleName || '').replace(/^\s*#?\s*\d+\s*/, ''));
-      if (fallbackNameHint) nameHints.push(fallbackNameHint);
-      const resolved = resolveGroupByUnitAndName(res.rows, cleanUnit, nameHints);
-      if (!resolved) return null;
-      const resolvedUnit = extractUnitNumber(resolved.group_name);
-      const matchReason = resolvedUnit === cleanUnit && nameHints.length > 0 ? 'unit+name' : 'unit';
+      const choice = chooseRoutedGroup({
+        stored, parsed, vehicleId, vehicleName, unitNumber,
+      });
+      if (choice.finding) {
+        await recordRoutingFinding(sharedPgPool, choice.finding);
+      }
+      if (!choice.group) return null;
+
       return {
-        telegramGroupId: String(resolved.telegram_group_id),
-        groupName: resolved.group_name,
-        matchReason,
+        telegramGroupId: String(choice.group.telegram_group_id),
+        groupName: choice.group.group_name,
+        matchReason: choice.matchReason,
       };
     } catch (err) {
       console.error('[Store] findGroupByUnit query failed:', err.message);
@@ -209,3 +212,55 @@ module.exports = {
     }
   },
 };
+
+/**
+ * The stored association: `groups.samsara_vehicle_id`, written by bot-backend's
+ * duplicate-unit scan only when the resolution is unambiguous in both
+ * directions. Returns null rather than a guess when two groups somehow claim the
+ * same vehicle — that contradiction belongs in a finding, not in a routing
+ * decision made at alert time.
+ */
+async function findGroupByVehicleId(vehicleId) {
+  const id = String(vehicleId || '').trim();
+  if (!id) return null;
+
+  const res = await sharedPgPool.query(
+    `SELECT id, telegram_group_id, group_name
+     FROM groups
+     WHERE samsara_vehicle_id = $1
+       AND group_type = 'driver'
+       AND active = TRUE`,
+    [id]
+  );
+  if (res.rows.length !== 1) return null;
+  return res.rows[0];
+}
+
+/** The parse that has always run. Unchanged, and now the fallback. */
+async function findGroupByNameParse(unitNumber, driverName, vehicleName) {
+  const cleanUnit = String(unitNumber || '').replace(/\D/g, '');
+  if (!cleanUnit) return null;
+
+  const res = await sharedPgPool.query(
+    `SELECT id, telegram_group_id, group_name
+     FROM groups
+     WHERE group_type = 'driver'
+       AND active = TRUE
+       AND group_name ILIKE $1
+     ORDER BY id DESC`,
+    [`%${cleanUnit}%`]
+  );
+
+  const nameHints = [driverName, vehicleName].map(normalizeName).filter(Boolean);
+  const fallbackNameHint = normalizeName(String(vehicleName || '').replace(/^\s*#?\s*\d+\s*/, ''));
+  if (fallbackNameHint) nameHints.push(fallbackNameHint);
+
+  const resolved = resolveGroupByUnitAndName(res.rows, cleanUnit, nameHints);
+  if (!resolved) return null;
+
+  const resolvedUnit = extractUnitNumber(resolved.group_name);
+  return {
+    ...resolved,
+    matchReason: resolvedUnit === cleanUnit && nameHints.length > 0 ? 'unit+name' : 'unit',
+  };
+}
