@@ -336,6 +336,17 @@ async function executePoll() {
             const body = await response.text();
             console.error(`[Poller] HTTP ${response.status}: ${body}`);
             lastApiError = { code: response.status, message: String(body).slice(0, 500), at: new Date().toISOString() };
+            // TOLD TO THE HUB. This branch returns without throwing, so it never
+            // reached the catch below — and a sustained 401 or 429 would have
+            // made the ledger go silent in exactly the way a dead process does,
+            // defeating the one distinction this heartbeat exists to draw.
+            //
+            // The STATUS CODE only. The body is Samsara's and can echo the
+            // request, including the key it was sent; the hub publishes a
+            // summary of this row on a public endpoint.
+            heartbeat.beat('error', {
+                detail: `the Samsara safety-events request returned HTTP ${response.status}`,
+            }).catch(() => {});
             if (response.status === 400 && body.includes(`invalid pagination 'after' parameter`)) {
                 console.warn('[Poller] Clearing invalid cursor so next poll uses time window only.');
                 clearCursor();
@@ -349,8 +360,14 @@ async function executePoll() {
         const nextCursor = json.pagination?.endCursor;
         json = null;
 
+        // HOISTED, because the heartbeat below reads it. It was declared inside
+        // the block and read after it, which throws a ReferenceError on every
+        // successful poll — the catch then recorded an `error` heartbeat and set
+        // `lastApiError`, so the observability change would have made every
+        // healthy poll report as a failure. Worse than the silence it was
+        // written to fix.
+        let newEventsCount = 0;
         if (events.length > 0) {
-            let newEventsCount = 0;
             for (const rawEvent of events) {
                 // In-memory dedup: delivered or already queued for delivery
                 if (SEEN_IDS.has(rawEvent.id) || PENDING_DELIVERY_IDS.has(rawEvent.id)) continue;
