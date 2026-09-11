@@ -207,6 +207,11 @@ module.exports = {
       if (!choice.group) return null;
 
       return {
+        // The internal id as well as the chat id: `driver_safety_events` keys on
+        // `groups.id`, and it is the join to the driver's permanent identity.
+        // Resolving it a second time from the chat id would be a second query
+        // for a value already in hand.
+        groupId: choice.group.id,
         telegramGroupId: String(choice.group.telegram_group_id),
         groupName: choice.group.group_name,
         matchReason: choice.matchReason,

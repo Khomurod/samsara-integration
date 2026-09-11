@@ -276,6 +276,9 @@ async function broadcast(alertData) {
             forcedId,
             managementGroupId: MANAGEMENT_GROUP_ID,
             getVideoBuffer,
+            // Keep every safety event, so a driver's PATTERN can be seen rather
+            // than each incident in isolation. Never throws, never blocks the send.
+            recordSafetyEvent: require('./src/safetyEventStore').recordSafetyEvent,
             // Driver-group-only music overlay. Applied inside sendDriverGroupAlert
             // to the driver group's video copy; the notifications group is never
             // routed through this.

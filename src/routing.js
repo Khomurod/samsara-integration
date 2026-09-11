@@ -183,6 +183,10 @@ async function determineTargetGroup(alertData, resolveGroupByUnit, managementGro
 
   return {
     targetGroupId: resolved.telegramGroupId,
+    // The internal `groups.id`, which is what every database join needs. The
+    // chat id is for Telegram; they are different keys and have been confused
+    // before.
+    internalGroupId: resolved.groupId ?? null,
     unitNumber: unitNumber || null,
     vehicleId,
     matchReason: resolved.matchReason || 'unit',
