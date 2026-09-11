@@ -91,6 +91,11 @@ async function deliverEvent(alertData, deps) {
     forcedId,
     managementGroupId,
     getVideoBuffer,
+    // Injected like every other collaborator here, so a test can watch what is
+    // recorded without a database. Defaults to a no-op rather than to the real
+    // store: a caller that has not wired it should record nothing, not silently
+    // reach for a pool that may not exist.
+    recordSafetyEvent = async () => false,
     // Optional DRIVER-GROUP-only video transform (music overlay). When present it
     // is handed to sendDriverGroupAlert and applied to the driver group's video
     // copy only. The notifications group / subscribers path never receives it.
@@ -132,6 +137,43 @@ async function deliverEvent(alertData, deps) {
   };
 
   const alert = { text, videoUrl, inwardVideoUrl, getVideoBuffer };
+
+  // ── 0) Resolve the driver's group, and KEEP THE EVENT ────────────────────────
+  //
+  // Both happen BEFORE any sending. Until now an event was formatted, sent and
+  // thrown away, so a driver's fourth hard brake this week produced exactly the
+  // message their first did and coaching was impossible by construction.
+  //
+  // It matters that this is first. Recording after the subscriber broadcast
+  // would lose the event whenever that branch threw — a Telegram outage would
+  // quietly erase the safety history it had nothing to do with.
+  //
+  // The resolution is unchanged and still happens once; section 2 uses this
+  // result rather than asking again.
+  const target = await determineTargetGroup(
+    alertObj,
+    store.findGroupByUnit.bind(store),
+    managementGroupId,
+  );
+  await recordSafetyEvent({
+    eventId,
+    behavior: alertObj?.eventLabel || alertObj?.enrichedEventType,
+    severity: alertObj?.severity,
+    gForce: alertObj?.gForce,
+    speedMph: alertObj?.speedMph,
+    postedSpeedMph: alertObj?.postedSpeedMph,
+    occurredAt: alertObj?.eventTime,
+    vehicleId: target.vehicleId,
+    vehicleName: alertObj?.vehicleName,
+    driverName: alertObj?.driverName,
+    groupId: target.internalGroupId,
+    lat: alertObj?.lat,
+    lng: alertObj?.lng,
+  }).catch((err) => {
+    // Keeping a record for later analysis must never stop the alert going out
+    // now. The alert is the thing a person acts on.
+    log.warn?.(`[Bot] Could not record safety event ${eventId || 'unknown'}: ${err.message}`);
+  });
 
   // ── 1) Notification subscribers + hardcoded notifications group ──────────────
   const subscribers = await store.getAll();
@@ -183,11 +225,6 @@ async function deliverEvent(alertData, deps) {
   }
 
   // ── 2) Matched driver group (send-only, via the main/feedback bot) ───────────
-  const target = await determineTargetGroup(
-    alertObj,
-    store.findGroupByUnit.bind(store),
-    managementGroupId,
-  );
   const targetDriverGroupId = target.targetGroupId;
   const unitLabel = target.unitNumber || 'unknown';
   const isFallback = String(target.matchReason || '').startsWith('fallback');
