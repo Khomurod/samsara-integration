@@ -19,6 +19,7 @@ const { reverseGeocode } = require('./geocoder');
 const { enrichSafetyEventWithMediaIfNeeded } = require('./safetyEventMedia');
 const { enqueueFormattedAlert } = require('./videoRetryDelivery');
 const { loadSamsaraConfig } = require('./samsaraSettings');
+const heartbeat = require('./hubHeartbeat');
 
 // ── The Samsara credential and base URL ──────────────────────────────────────
 // MUTABLE, and `executePoll` is their only writer. They start as the
@@ -273,11 +274,17 @@ async function executePoll() {
     const cfg = await refreshRuntimeConfig();
     if (cfg && cfg.enabled === false) {
         console.log('[Poller] Samsara is disabled in the admin panel; skipping this poll.');
+        // Told to the hub as `blocked`, not as silence. "Switched off in the
+        // admin panel" and "this service died" are different problems and were
+        // previously the same empty table.
+        heartbeat.beat('blocked', { detail: 'Samsara is switched off in the admin panel' })
+            .catch(() => {});
         executePoll.isRunning = false;
         return;
     }
     if (!SAMSARA_API_KEY) {
         console.warn('[Poller] No Samsara API key (admin panel or SAMSARA_API_KEY). Cannot poll.');
+        heartbeat.beat('blocked', { detail: 'no Samsara API key is configured' }).catch(() => {});
         executePoll.isRunning = false;
         return;
     }
@@ -389,9 +396,18 @@ async function executePoll() {
         lastSuccessfulPollAt = Date.now();
         lastPollEndTime = endTime;
 
+        // AND TELL THE HUB. It shares this database and nothing else, so
+        // without this row a dead poller and a quiet fleet are the same
+        // evidence on its side. Counts only — no event, no driver, no vehicle.
+        heartbeat.beat('ok', { summary: { newEvents: newEventsCount } }).catch(() => {});
+
     } catch (err) {
         console.error('[Poller] Fetch error:', err.message);
         lastApiError = { code: 'FETCH_ERROR', message: String(err.message).slice(0, 500), at: new Date().toISOString() };
+        // The MESSAGE is Samsara's and can echo a request; only its shape
+        // travels to a database the hub publishes a summary of.
+        heartbeat.beat('error', { detail: 'the Samsara safety-events request failed' })
+            .catch(() => {});
     } finally {
         executePoll.isRunning = false;
     }
