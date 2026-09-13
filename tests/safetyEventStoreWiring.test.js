@@ -205,3 +205,38 @@ test('a label with nothing but a year keeps the year rather than inventing null'
   assert.equal(u(''), null);
   assert.equal(u(null), null);
 });
+
+// ── the one fact that reached no screen ─────────────────────────────────────
+
+/**
+ * `recordingStatus()` HAD NO CALLER.
+ *
+ * It answers the only question an empty `driver_safety_events` cannot: whether
+ * this service can write at all. Exported, tested, and reaching nothing — which
+ * is the same shape as the bug it was written to make visible, one layer up.
+ * It is now on /health and in the hub heartbeat, so both sides can tell a quiet
+ * fleet from a store that is refusing writes.
+ */
+test('the poller reports whether it can record, and the health handler surfaces it', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const root = path.resolve(__dirname, '..');
+
+  const indexSrc = fs.readFileSync(path.join(root, 'index.js'), 'utf8');
+  assert.match(indexSrc, /safetyStore\s*=\s*require\('\.\/src\/safetyEventStore'\)\.recordingStatus\(\)/,
+    '/health must publish whether the store can write');
+
+  const pollerSrc = fs.readFileSync(path.join(root, 'src/poller.js'), 'utf8');
+  assert.match(pollerSrc, /recordingReady:\s*safetyStore\.recordingStatus\(\)\.ready === true/,
+    'the heartbeat must carry it to the hub, beside the event count');
+  assert.match(pollerSrc, /newEvents:\s*newEventsCount/,
+    'and the count itself, which is what tells a quiet fleet apart');
+});
+
+/** It must never carry anything but booleans and a short reason. */
+test('the recording status leaks no event, driver or credential', () => {
+  const status = loadStore(null).recordingStatus();
+  assert.deepEqual(Object.keys(status).sort(), ['configured', 'lastFailure', 'ready']);
+  assert.equal(typeof status.ready, 'boolean');
+  assert.equal(typeof status.configured, 'boolean');
+});

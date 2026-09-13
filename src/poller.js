@@ -20,6 +20,7 @@ const { enrichSafetyEventWithMediaIfNeeded } = require('./safetyEventMedia');
 const { enqueueFormattedAlert } = require('./videoRetryDelivery');
 const { loadSamsaraConfig } = require('./samsaraSettings');
 const heartbeat = require('./hubHeartbeat');
+const safetyStore = require('./safetyEventStore');
 
 // ── The Samsara credential and base URL ──────────────────────────────────────
 // MUTABLE, and `executePoll` is their only writer. They start as the
@@ -416,7 +417,15 @@ async function executePoll() {
         // AND TELL THE HUB. It shares this database and nothing else, so
         // without this row a dead poller and a quiet fleet are the same
         // evidence on its side. Counts only — no event, no driver, no vehicle.
-        heartbeat.beat('ok', { summary: { newEvents: newEventsCount } }).catch(() => {});
+        // `recordingReady` travels with the count so the hub can tell the two
+        // causes of an empty safety table apart without a second query: events
+        // seen but not stored is a recorder problem, both zero is a quiet fleet.
+        heartbeat.beat('ok', {
+            summary: {
+                newEvents: newEventsCount,
+                recordingReady: safetyStore.recordingStatus().ready === true,
+            },
+        }).catch(() => {});
 
     } catch (err) {
         console.error('[Poller] Fetch error:', err.message);

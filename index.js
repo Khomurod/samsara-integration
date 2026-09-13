@@ -145,6 +145,14 @@ app.get('/health', (req, res) => {
         // Recovery is reported but NEVER affects the health verdict: a stuck
         // video must not make an otherwise-healthy safety-event poller look dead.
         report.body.videoRecovery = videoRecoveryWorker.getStatus();
+        // CAN THIS SERVICE KEEP AN EVENT AT ALL? `recordingStatus` has answered
+        // that since the store was repaired and NOTHING HAS EVER ASKED IT — the
+        // one fact that tells a quiet fleet apart from a store that cannot
+        // write, exported, tested, and reaching no screen. Reported like video
+        // recovery: never part of the verdict, because a database that is
+        // refusing writes must not make the poller look dead when it is still
+        // fetching and still alerting.
+        report.body.safetyStore = require('./src/safetyEventStore').recordingStatus();
         res.status(report.statusCode).json(report.body);
     } catch (err) {
         // /health must never throw; fall back to the legacy minimal shape.
