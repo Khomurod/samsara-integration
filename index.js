@@ -400,6 +400,12 @@ async function start() {
     await store.init();
     await samsaraDb.initPgDb();
     await videoRecoveryStore.ensureSchema();
+    // ANSWERED BEFORE AN INCIDENT, NOT AFTER. This is the same idempotent
+    // statement the first safety event would have run; running it here is what
+    // lets /health say whether this service can record at all, rather than
+    // whether a driver has done something wrong since the last restart. It
+    // catches its own failures and returns false, so it can never fail boot.
+    await require('./src/safetyEventStore').ensureTable();
     await new Promise((resolve) => {
         httpServer = app.listen(PORT, resolve);
     });
