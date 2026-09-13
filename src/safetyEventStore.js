@@ -78,6 +78,18 @@ let lastFailure = null;
  * "No DATABASE_URL" and "the query failed" are reported apart. The first is a
  * deployment that was never meant to record; the second is a fault. Collapsing
  * them into one false is how the bug above stayed invisible.
+ *
+ * CALLED AT STARTUP AS WELL AS ON THE FIRST EVENT, and that is the point.
+ * Reached only from `recordSafetyEvent`, `ready` below answered "has an event
+ * been recorded since boot" — a fact about the FLEET wearing the clothes of a
+ * fact about the SERVICE. Production said `{ ready: false, configured: true,
+ * lastFailure: null }` and the honest reading was "nothing has been tried yet",
+ * which left the connection, the credentials, the permissions and the schema
+ * unproven until the first incident. An incident is the worst moment to find
+ * out the role cannot write.
+ *
+ * It is idempotent and it writes no row, so arming it early invents nothing:
+ * an empty table stays empty.
  */
 async function ensureTable() {
   if (ensured) return true;
@@ -225,5 +237,5 @@ async function recordSafetyEvent({
 }
 
 module.exports = {
-  CREATE_TABLE_SQL, unitFromVehicleName, recordSafetyEvent, recordingStatus,
+  CREATE_TABLE_SQL, ensureTable, unitFromVehicleName, recordSafetyEvent, recordingStatus,
 };

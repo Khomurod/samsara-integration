@@ -240,3 +240,70 @@ test('the recording status leaks no event, driver or credential', () => {
   assert.equal(typeof status.ready, 'boolean');
   assert.equal(typeof status.configured, 'boolean');
 });
+
+// ── proving it can write BEFORE an incident, not after ──────────────────────
+
+/**
+ * `ready` COULD NOT BECOME TRUE UNTIL A DRIVER DID SOMETHING WRONG.
+ *
+ * Found in production the hour after the status above shipped: the live
+ * endpoint answered `{ ready: false, configured: true, lastFailure: null }`.
+ * Reading that carefully is the whole finding. `configured: true` says the pool
+ * exists. `lastFailure: null` says nothing has failed. `ready: false` therefore
+ * does not mean broken — it means NOTHING HAS BEEN TRIED, because `ensureTable`
+ * was reached only from `recordSafetyEvent`.
+ *
+ * So the field answered "has an event been recorded since boot", which is a
+ * fact about the fleet, while reading like a fact about the service. The
+ * connection, the credentials, the permissions and the schema all stayed
+ * unproven until the first incident — and an incident is the worst possible
+ * moment to discover the table is missing or the role cannot write to it.
+ *
+ * The fix invents nothing. It runs the SAME idempotent statement the first
+ * event would have run, at startup, beside `videoRecoveryStore.ensureSchema()`
+ * which has always been awaited there for exactly this reason. No event is
+ * fabricated; an empty table stays empty.
+ */
+test('the store proves it can write at startup, without waiting for an event', async () => {
+  const pool = fakePool();
+  const store = loadStore(pool);
+
+  assert.equal(store.recordingStatus().ready, false, 'nothing has been attempted yet');
+
+  const ok = await store.ensureTable();
+
+  assert.equal(ok, true);
+  assert.equal(store.recordingStatus().ready, true,
+    'the service can answer for itself before any driver does anything wrong');
+  assert.equal(store.recordingStatus().lastFailure, null);
+  assert.ok(
+    pool.queries.some((q) => /CREATE TABLE IF NOT EXISTS driver_safety_events/.test(q.sql)),
+    'and it answered by running the statement, not by assuming'
+  );
+  assert.ok(
+    !pool.queries.some((q) => /INSERT INTO driver_safety_events/.test(q.sql)),
+    'NEVER by writing a row — an empty table stays empty'
+  );
+});
+
+/** A database that refuses says so, instead of looking like a quiet fleet. */
+test('a store that cannot create its table reports the failure, and does not throw', async () => {
+  const store = loadStore(fakePool({ failOn: 'CREATE TABLE IF NOT EXISTS driver_safety_events' }));
+
+  const ok = await store.ensureTable();
+
+  assert.equal(ok, false);
+  const status = store.recordingStatus();
+  assert.equal(status.ready, false);
+  assert.equal(status.configured, true, 'the pool is there; the statement is what failed');
+  assert.match(status.lastFailure, /^ensure_failed: /);
+});
+
+/** And the startup path actually calls it — the failure mode is a missing line. */
+test('startup awaits the store ensure, beside the video-recovery one', () => {
+  const fs = require('node:fs');
+  const src = fs.readFileSync(require('node:path').resolve(__dirname, '..', 'index.js'), 'utf8');
+  assert.match(src, /await\s+videoRecoveryStore\.ensureSchema\(\);/);
+  assert.match(src, /await\s+require\('\.\/src\/safetyEventStore'\)\.ensureTable\(\)/,
+    'a status nothing arms answers about the fleet, not about the service');
+});
