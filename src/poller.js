@@ -65,6 +65,25 @@ let lastSuccessfulPollAt = null; // ms epoch of the last HTTP 2xx poll
 let lastPollEndTime = null;      // ISO endTime of the last HTTP 2xx poll
 let lastApiError = null;         // { code, message, at } — sanitized before it leaves /health
 
+/**
+ * How many events this process has picked up, and since when.
+ *
+ * THE PAIR THE HUB RECONCILES AGAINST. `newEvents` in the heartbeat is the last
+ * poll only — almost always zero — while the hub counts `driver_safety_events`
+ * rows over a fortnight. Two numbers on different scales cannot disagree
+ * usefully, so "the poller saw events and none were stored" was invisible in
+ * aggregate: the only way to notice was to already suspect it.
+ *
+ * A running total plus the instant it started from gives the hub one
+ * subtraction: rows recorded since `seenSince` against `eventsSeenTotal`. Fewer
+ * rows than events seen is a recorder problem, named outright.
+ *
+ * Reset by a restart, deliberately — which is exactly why the instant travels
+ * with the count rather than being assumed.
+ */
+let eventsSeenTotal = 0;
+const SEEN_SINCE = new Date().toISOString();
+
 // Keep track of recently seen event IDs to prevent duplicates if the cursor
 // hasn't updated yet or if we fall back to time-based polling.
 const SEEN_IDS = new Set();
@@ -394,6 +413,14 @@ async function executePoll() {
             
             if (newEventsCount > 0) {
                 console.log(`[Poller] Picked up ${newEventsCount} new event(s).`);
+                // RUNNING TOTAL SINCE BOOT, so the hub has something it can
+                // actually compare. `newEvents` is the LAST poll only and is
+                // almost always zero, while the hub counts rows over fourteen
+                // days — two numbers that can never disagree usefully, so
+                // "events were seen and not stored" was undetectable in
+                // aggregate. Paired with `seenSince` below, this gives the hub
+                // exactly one subtraction to do.
+                eventsSeenTotal += newEventsCount;
             }
         } else {
             // Uncomment if you want noisy logs
@@ -424,6 +451,12 @@ async function executePoll() {
             summary: {
                 newEvents: newEventsCount,
                 recordingReady: safetyStore.recordingStatus().ready === true,
+                // The two the hub reconciles against its own row count. Reset
+                // by a restart, which is why the instant travels with the
+                // total — a count with no "since" cannot be compared to
+                // anything.
+                eventsSeenTotal,
+                seenSince: SEEN_SINCE,
             },
         }).catch(() => {});
 
