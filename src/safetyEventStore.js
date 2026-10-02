@@ -71,6 +71,12 @@ CREATE INDEX IF NOT EXISTS idx_driver_safety_events_behavior
 let ensured = false;
 /** Why the last attempt could not record, for the health probe below. */
 let lastFailure = null;
+// Events handed in that could not be kept because a field the row needs was
+// missing. Counted and named, never silent: a refusal that only returned
+// `false` is how every event since recording shipped was dropped with nothing
+// in the log, while the store reported itself ready.
+let refusedSinceBoot = 0;
+let lastRefusal = null;
 
 /**
  * Create the table if this service booted before the hub applied its migration.
@@ -118,7 +124,7 @@ async function ensureTable() {
  * same empty table.
  */
 function recordingStatus() {
-  return { ready: ensured, configured: Boolean(db()), lastFailure };
+  return { ready: ensured, configured: Boolean(db()), lastFailure, refusedSinceBoot, lastRefusal };
 }
 
 /**
@@ -207,7 +213,20 @@ async function recordSafetyEvent({
   occurredAt, vehicleId = null, vehicleName = null, driverName = null, groupId = null,
   lat = null, lng = null,
 }) {
-  if (!eventId || !behavior || !occurredAt) return false;
+  const missing = [
+    !eventId && 'eventId', !behavior && 'behavior', !occurredAt && 'occurredAt',
+  ].filter(Boolean);
+  if (missing.length) {
+    refusedSinceBoot += 1;
+    lastRefusal = `missing ${missing.join(', ')}`;
+    // The first refusal and then every 50th: loud enough to be found in a
+    // log, not so loud that a systematic fault buries everything else.
+    if (refusedSinceBoot === 1 || refusedSinceBoot % 50 === 0) {
+      console.warn(`[SafetyStore] event ${eventId || 'unknown'} not recorded: ${lastRefusal} `
+        + `(${refusedSinceBoot} refused since boot)`);
+    }
+    return false;
+  }
   if (!(await ensureTable())) return false;
   const pool = db();
   if (!pool) return false;

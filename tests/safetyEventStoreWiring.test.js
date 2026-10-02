@@ -154,7 +154,9 @@ test('a failing database is reported AS A FAULT, with the reason kept', async ()
 test('a healthy store reports ready, so an empty table can be told from a broken one', async () => {
   const store = loadStore(fakePool());
   await store.recordSafetyEvent(EVENT);
-  assert.deepEqual(store.recordingStatus(), { ready: true, configured: true, lastFailure: null });
+  assert.deepEqual(store.recordingStatus(), {
+    ready: true, configured: true, lastFailure: null, refusedSinceBoot: 0, lastRefusal: null,
+  });
 });
 
 test('an incomplete event is refused before any query', async () => {
@@ -236,7 +238,11 @@ test('the poller reports whether it can record, and the health handler surfaces 
 /** It must never carry anything but booleans and a short reason. */
 test('the recording status leaks no event, driver or credential', () => {
   const status = loadStore(null).recordingStatus();
-  assert.deepEqual(Object.keys(status).sort(), ['configured', 'lastFailure', 'ready']);
+  assert.deepEqual(Object.keys(status).sort(),
+    ['configured', 'lastFailure', 'lastRefusal', 'ready', 'refusedSinceBoot']);
+  // The refusal reason names FIELDS, never an event id, a driver or a value.
+  assert.ok(status.lastRefusal === null || /^missing [a-zA-Z, ]+$/.test(status.lastRefusal));
+  assert.equal(typeof status.refusedSinceBoot, 'number');
   assert.equal(typeof status.ready, 'boolean');
   assert.equal(typeof status.configured, 'boolean');
 });

@@ -162,8 +162,8 @@ test('sanitizeErrorMessage scrubs tokens, telegram tokens and query secrets', ()
   assert.equal(sanitizeErrorMessage(null), null);
   assert.doesNotMatch(sanitizeErrorMessage('Bearer samsara_api_abcdEFGH1234'), /samsara_api_abcdEFGH1234/);
   assert.doesNotMatch(
-    sanitizeErrorMessage('conflict for token 7955098141:AAETM0NoXQabGLJT6HW8IarBGxf6hZmt2Ys'),
-    /7955098141:AAETM0NoXQabGLJT6HW8IarBGxf6hZmt2Ys/,
+    sanitizeErrorMessage('conflict for token 123456789:AAFAKE-not-a-real-token-for-tests-only'),
+    /123456789:AAFAKE-not-a-real-token-for-tests-only/,
   );
   assert.doesNotMatch(sanitizeErrorMessage('failed https://x.test/media?apikey=SEKRET&x=1'), /SEKRET/);
   // Truncation cap.

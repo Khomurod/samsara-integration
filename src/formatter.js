@@ -417,7 +417,27 @@ function formatAlert(payload) {
 
             const inwardVideoUrl = payload._enrichedVideoUrlInward || null;
 
-            return { text, videoUrl, inwardVideoUrl, isCrash, eventLabel: description };
+            // THE FACTS, beside the words. The text above is for a person; the
+            // recorder (src/safetyEventStore.js) needs the same event as data,
+            // and it refuses a row with no time. This branch computed `time`
+            // and never handed it on, so from the day recording shipped every
+            // event reached the store without one and none was ever kept —
+            // the safety history, the coach and the driver context all read
+            // an empty table. Numbers only; a display string like "N/A" is
+            // never a value.
+            const num = (v) => (v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+            const kmhToMph = (v) => (num(v) == null ? null : Math.round(num(v) * 0.621371 * 100) / 100);
+            const where = details.location || details.harshEvent?.location || null;
+            return {
+                text, videoUrl, inwardVideoUrl, isCrash, eventLabel: description,
+                eventTime: time || null,
+                severity: severity !== 'N/A' ? severity : null,
+                gForce: num(details.harshEvent?.gForce),
+                speedMph: kmhToMph(details.speed?.currentSpeedKilometersPerHour),
+                postedSpeedMph: kmhToMph(details.speed?.thresholdSpeedKilometersPerHour),
+                lat: num(where?.latitude),
+                lng: num(where?.longitude),
+            };
         }
 
         // ── Generic fallback ────────────
