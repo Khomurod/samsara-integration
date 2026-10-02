@@ -451,6 +451,10 @@ async function executePoll() {
             summary: {
                 newEvents: newEventsCount,
                 recordingReady: safetyStore.recordingStatus().ready === true,
+                // How many events the store REFUSED since boot for a missing
+                // field. Beside eventsSeenTotal it lets the hub say why events
+                // were lost, not only that they were.
+                recordingRefused: safetyStore.recordingStatus().refusedSinceBoot,
                 // The two the hub reconciles against its own row count. Reset
                 // by a restart, which is why the instant travels with the
                 // total — a count with no "since" cannot be compared to
