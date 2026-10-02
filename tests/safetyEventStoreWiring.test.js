@@ -83,6 +83,31 @@ test('THE REAL recordSafetyEvent WRITES A ROW — the wiring is executed here', 
   assert.ok(insert, 'an INSERT actually reached the pool');
 });
 
+test('A MISSING MEASUREMENT IS STORED AS NULL, never as a fabricated zero', async () => {
+  // Number(null) and Number('') are both 0 in JavaScript. A harsh brake with no
+  // speed and no location would have been stored as 0 mph at (0, 0) — a fact
+  // nobody observed, sitting in the history a coach reads.
+  const pool = fakePool();
+  const store = loadStore(pool);
+  await store.recordSafetyEvent({
+    ...EVENT, gForce: null, speedMph: undefined, postedSpeedMph: '', lat: null, lng: null,
+  });
+  const insert = pool.queries.find((q) => /INSERT INTO driver_safety_events/.test(q.sql));
+  // Column order: g_force, speed_mph, posted_speed_mph are 9-11; lat, lng 13-14.
+  const [gForce, speed, posted] = insert.params.slice(8, 11);
+  const [lat, lng] = insert.params.slice(12, 14);
+  assert.deepEqual([gForce, speed, posted, lat, lng], [null, null, null, null, null]);
+});
+
+test('a real zero is still a zero', async () => {
+  const pool = fakePool();
+  const store = loadStore(pool);
+  await store.recordSafetyEvent({ ...EVENT, speedMph: 0, gForce: '0.0' });
+  const insert = pool.queries.find((q) => /INSERT INTO driver_safety_events/.test(q.sql));
+  assert.equal(insert.params[8], 0);
+  assert.equal(insert.params[9], 0);
+});
+
 test('the table is ensured once, not on every event', async () => {
   const pool = fakePool();
   const store = loadStore(pool);

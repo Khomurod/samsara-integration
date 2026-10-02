@@ -192,6 +192,10 @@ async function resolvePersonForGroup(groupId) {
 }
 
 function toNumberOrNull(value) {
+  // Absent is NOT zero. Number(null) and Number('') are both 0, which would
+  // store a harsh brake with no speed as "0 mph at (0, 0)" — a measurement
+  // nobody took. Only a value that is actually present becomes a number.
+  if (value == null || (typeof value === 'string' && value.trim() === '')) return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 }
