@@ -18,16 +18,19 @@ const { recordRoutingFinding } = require('./routingFindings');
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const REDIS_KEY = 'samsara_bot_subscribers';
-const DATABASE_URL = process.env.DATABASE_URL;
 
 const USE_REDIS = !!(REDIS_URL && REDIS_TOKEN);
-let sharedPgPool = null;
-if (DATABASE_URL) {
-  const { Pool } = require('pg');
-  sharedPgPool = new Pool({
-    connectionString: DATABASE_URL,
-    ssl: { rejectUnauthorized: false },
-  });
+
+/**
+ * The process's ONE Postgres pool (src/db.js), or null without DATABASE_URL.
+ *
+ * This file used to open a second pool of its own; see src/db.js for what the
+ * extra connections cost. Looked up when a query runs rather than when this
+ * file loads, so the order in which modules require each other can never leave
+ * it holding a half-loaded db module.
+ */
+function pgPool() {
+  return require('./db').getPgPool();
 }
 
 // ── Redis store ───────────────────────────────────────────────────────────────
@@ -178,7 +181,8 @@ module.exports = {
    */
   async findGroupByUnit(unitNumber, driverName, vehicleName, vehicleId = null) {
     if (!unitNumber && !vehicleId) return null;
-    if (!sharedPgPool) {
+    const pool = pgPool();
+    if (!pool) {
       console.warn('[Store] DATABASE_URL not set — cannot resolve unit group.');
       return null;
     }
@@ -190,8 +194,8 @@ module.exports = {
       // `serious` finding on day one instead of a driver who quietly stops
       // receiving safety alerts. It is one extra indexed lookup on a table of a
       // few hundred rows, per safety event.
-      const claims = await findGroupsByVehicleId(vehicleId);
-      const parsed = await findGroupByNameParse(unitNumber, driverName, vehicleName);
+      const claims = await findGroupsByVehicleId(pool, vehicleId);
+      const parsed = await findGroupByNameParse(pool, unitNumber, driverName, vehicleName);
 
       const choice = chooseRoutedGroup({
         stored: claims.length === 1 ? claims[0] : null,
@@ -202,7 +206,7 @@ module.exports = {
         unitNumber,
       });
       if (choice.finding) {
-        await recordRoutingFinding(sharedPgPool, choice.finding);
+        await recordRoutingFinding(pool, choice.finding);
       }
       if (!choice.group) return null;
 
@@ -234,11 +238,11 @@ module.exports = {
  * over. `chooseRoutedGroup` turns the first into a `serious` finding; collapsing
  * them here would have hidden it behind a silent fallback to the name parse.
  */
-async function findGroupsByVehicleId(vehicleId) {
+async function findGroupsByVehicleId(pool, vehicleId) {
   const id = String(vehicleId || '').trim();
   if (!id) return [];
 
-  const res = await sharedPgPool.query(
+  const res = await pool.query(
     `SELECT id, telegram_group_id, group_name
      FROM groups
      WHERE samsara_vehicle_id = $1
@@ -251,11 +255,11 @@ async function findGroupsByVehicleId(vehicleId) {
 }
 
 /** The parse that has always run. Unchanged, and now the fallback. */
-async function findGroupByNameParse(unitNumber, driverName, vehicleName) {
+async function findGroupByNameParse(pool, unitNumber, driverName, vehicleName) {
   const cleanUnit = String(unitNumber || '').replace(/\D/g, '');
   if (!cleanUnit) return null;
 
-  const res = await sharedPgPool.query(
+  const res = await pool.query(
     `SELECT id, telegram_group_id, group_name
      FROM groups
      WHERE group_type = 'driver'

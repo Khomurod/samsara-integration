@@ -36,7 +36,7 @@
 ```
 index.js ── Express (/health) + notification bot + send-only driverBot + pollCoordinator
   └── src/
-       ├── Polling      poller.js · speedingPoller.js · pollCoordinator.js
+       ├── Polling      poller.js · speedingPoller.js · speedingPollState.js · pollCoordinator.js
        ├── Delivery     broadcastDelivery.js · driverGroupDelivery.js · routing.js
        │                deliveryTracker.js · deliveryWarnings.js
        ├── Video        safetyEventMedia.js · videoBackfill.js · videoRetryDelivery.js
@@ -63,6 +63,7 @@ SIGINT/SIGTERM.
 |---|---|
 | `src/poller.js` | Polls `/fleet/safety-events` (cursor + time-window watermark); dedupes; formats; enqueues at 2s spacing. |
 | `src/speedingPoller.js` | Separate `/safety-events/stream` poller for speeding labels; isolated cursor/dedup state (`speed:`-namespaced IDs). It no longer carries its own copy of the camera-retrieval calls — that was a second implementation of `cameraMediaRetrieval.js` that could not survive a restart. |
+| `src/speedingPollState.js` | Where the speeding poller keeps its place: cursor and watermark through `db.js`'s poll-state cache, delivered IDs in `samsara_processed_events` — all on the shared pool — or a JSON file under `data/` with no database. |
 | `src/pollCoordinator.js` | Runs the two pollers **sequentially** (safety → 15s → speeding → 15s → repeat) so they never run concurrently. |
 
 ### Delivery / routing
@@ -93,7 +94,7 @@ SIGINT/SIGTERM.
 ### Settings
 | File | Responsibility |
 |---|---|
-| `src/samsaraSettings.js` | Reads `samsara_settings` (written by the admin panel) over the shared database, with the environment as a per-value fallback. One shared, briefly-cached store for the whole process. |
+| `src/samsaraSettings.js` | Reads `samsara_settings` (written by the admin panel) over the shared database, with the environment as a per-value fallback. One shared store for the whole process, reading only the columns it uses and caching the row for **5 minutes** (a failed read is retried after 30 s) — so a change saved in the panel lands within five minutes. |
 | `src/sharedIntegrationCrypto.js` | The AES-256-GCM envelope this service and `bot-backend` both open, keyed from a secret both already hold. Mirrored file — keep the two identical. |
 
 ### AI
@@ -106,7 +107,7 @@ SIGINT/SIGTERM.
 ### Shared infrastructure
 | File | Responsibility |
 |---|---|
-| `src/db.js` | Postgres pool + cursor storage; processed-events dedupe table; poll watermark; per-target delivery ledger. (It carried a second, legacy `findGroupByUnit` with no `active` filter, no name check and `ORDER BY id DESC LIMIT 1` as its tiebreak. It had no callers and is deleted; `store.js` is the one router.) |
+| `src/db.js` | **The ONE Postgres pool** (`getPgPool()`) — nothing else may build one. Max 3 connections, 10-minute idle timeout, TCP keepalive and an `error` handler; `PG_POOL_MAX` / `PG_IDLE_TIMEOUT_MS` override. Each new connection costs several KB of Supabase egress, and three pools at node-pg's 10 s default reconnected on nearly every poll. Also: cursor storage; processed-events dedupe table; `samsara_poll_state` (read once per key, written only when a value changes); per-target delivery ledger. (It carried a second, legacy `findGroupByUnit` with no `active` filter, no name check and `ORDER BY id DESC LIMIT 1` as its tiebreak. It had no callers and is deleted; `store.js` is the one router.) |
 | `src/store.js` | Subscriber storage (Upstash Redis or local JSON fallback) + `findGroupByUnit()`: runs the stored-id lookup **and** the name parse, prefers the stored link, files a finding whenever the parse was the one that answered. |
 | `src/formatter.js` | Raw Samsara payload → human-readable HTML Telegram message. |
 | `src/geocoder.js` | Reverse-geocode lat/lon → "City, State" (BigDataCloud) when Samsara omits an address. |

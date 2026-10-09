@@ -60,6 +60,21 @@ const CREATE_INDEXES_SQL = [
 /** A claim older than this belonged to a process that died mid-job. */
 const STALE_LOCK_MS = 10 * 60 * 1000;
 
+/**
+ * Every column src/videoRecoveryWorker.js reads from a claimed job — and only
+ * those. The claim runs every 30 s and is almost always empty, but
+ * `RETURNING *` still sent a description of all nineteen columns each time,
+ * and a claimed row carries `raw_event`, the largest of them. A field the
+ * worker starts reading must be added here
+ * (tests/samsaraVideoRecoveryStore.test.js checks the worker against it).
+ *
+ * Every other statement returns `id` alone: those callers only ask whether a
+ * row came back, and echoing `raw_event` and `targets` after every step was
+ * pure egress.
+ */
+const JOB_COLUMNS = `id, samsara_event_id, vehicle_id, is_speeding, raw_event, targets, status,
+            attempts, retrieval_id, retrieval_requested_at, retrieval_start_time, retrieval_end_time`;
+
 const OPEN_STATUSES = ['pending_recheck', 'pending_retrieval', 'video_available'];
 
 /** Trim an error to something a table column and a human can both hold. */
@@ -98,7 +113,7 @@ function createVideoRecoveryStore({ pool, log = console } = {}) {
    * exactly one recovery — and therefore at most one Samsara retrieval request
    * — per event.
    *
-   * @returns {Promise<{created: boolean, job: object|null}>}
+   * @returns {Promise<{created: boolean, job: {id: string}|null}>}
    */
   async function enqueue({
     eventId, vehicleId = null, eventTime = null, isSpeeding = false,
@@ -111,7 +126,7 @@ function createVideoRecoveryStore({ pool, log = console } = {}) {
            (samsara_event_id, vehicle_id, event_time, is_speeding, raw_event, targets, status, next_check_at)
          VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, 'pending_recheck', $7)
          ON CONFLICT (samsara_event_id) DO NOTHING
-         RETURNING *`,
+         RETURNING id`,
         [
           String(eventId),
           vehicleId == null ? null : String(vehicleId),
@@ -124,7 +139,7 @@ function createVideoRecoveryStore({ pool, log = console } = {}) {
       );
       if (res.rows[0]) return { created: true, job: res.rows[0] };
       const existing = await pool.query(
-        'SELECT * FROM samsara_video_recovery_jobs WHERE samsara_event_id = $1',
+        'SELECT id FROM samsara_video_recovery_jobs WHERE samsara_event_id = $1',
         [String(eventId)],
       );
       return { created: false, job: existing.rows[0] || null };
@@ -157,7 +172,7 @@ function createVideoRecoveryStore({ pool, log = console } = {}) {
              LIMIT $1
              FOR UPDATE SKIP LOCKED
           )
-          RETURNING *`,
+          RETURNING ${JOB_COLUMNS}`,
         [limit, now, new Date(now.getTime() - STALE_LOCK_MS)],
       );
       return res.rows;
@@ -208,7 +223,7 @@ function createVideoRecoveryStore({ pool, log = console } = {}) {
                 locked_at = NULL,
                 updated_at = NOW()
           WHERE id = $1
-          RETURNING *`,
+          RETURNING id`,
         [
           jobId, status, nextCheckAt || new Date(), shortError(lastError),
           retrievalId || null, retrievalStartTime || null, retrievalEndTime || null,
@@ -241,7 +256,7 @@ function createVideoRecoveryStore({ pool, log = console } = {}) {
                 completed_at = NOW(),
                 updated_at = NOW()
           WHERE id = $1
-          RETURNING *`,
+          RETURNING id`,
         [jobId, status, shortError(lastError), targets === null ? null : JSON.stringify(targets)],
       );
       // NULL means the row was not there; the caller must not read that as

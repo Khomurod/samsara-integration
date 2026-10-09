@@ -1,6 +1,7 @@
 /**
  * db.js
- * Persistent storage for the Samsara API pagination cursor.
+ * Persistent storage for the Samsara API pagination cursor, and the owner of
+ * the ONE Postgres pool this process opens.
  * Uses better-sqlite3 if available, or falls back to JSON file storage.
  */
 
@@ -8,11 +9,52 @@ const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
 
+// ── The ONE Postgres pool ────────────────────────────────────────────────────
+// Every module reaches Postgres through `getPgPool()`, and nothing else may
+// call `new Pool` — tests/sharedPgPool.test.js fails if anything does.
+//
+// WHY THESE SETTINGS. The database is Supabase on the Free plan, where egress
+// is the budget, and every NEW connection costs a TLS handshake, SCRAM auth and
+// a burst of parameter-status messages — several KB before the first query.
+// Measured in production on 2026-10-09 with this service alone on the
+// database: ~3.3 new connections a minute, ~4,800 a day, more egress than the
+// whole daily budget. The cause was three pools (here, store.js and
+// speedingPoller.js), each closing an idle connection after node-pg's default
+// 10 s while the poll runs every 15 s — so nearly every poll reconnected.
+//
+//   idleTimeoutMillis — 10 minutes, far longer than any gap between polls, so
+//       one connection is opened and then reused. Back near 10 s, the
+//       reconnect on every poll returns.
+//   max — every caller runs one short `pool.query` and never holds a client,
+//       so a few connections cover both pollers, the delivery queues, the
+//       recovery worker and the heartbeat; a query beyond that waits its turn.
+//   keepAlive — TCP keepalive probes on an idle connection, so a NAT or proxy
+//       on the way does not silently drop one the pool still thinks is open.
+//   on('error') — a dropped IDLE connection is reported on the pool itself,
+//       and an 'error' event with no listener is an uncaught exception.
+//
+// PG_POOL_MAX and PG_IDLE_TIMEOUT_MS override the two numbers without a code
+// change; 0 for the idle timeout is node-pg's "never close an idle client".
+function intFromEnv(name, fallback, min) {
+    const parsed = Number.parseInt(process.env[name] || '', 10);
+    return Number.isFinite(parsed) && parsed >= min ? parsed : fallback;
+}
+
 let pgPool = null;
 if (process.env.DATABASE_URL) {
     pgPool = new Pool({
         connectionString: process.env.DATABASE_URL,
-        ssl: { rejectUnauthorized: false }
+        ssl: { rejectUnauthorized: false },
+        max: intFromEnv('PG_POOL_MAX', 3, 1),
+        idleTimeoutMillis: intFromEnv('PG_IDLE_TIMEOUT_MS', 600_000, 0),
+        keepAlive: true,
+        keepAliveInitialDelayMillis: 60_000,
+    });
+    // node-pg has already discarded the client by the time this fires; the
+    // next query simply opens a new connection. The MESSAGE only — never the
+    // error object, which can carry connection details.
+    pgPool.on('error', (err) => {
+        console.error('[DB] Idle Postgres connection lost; the pool will reconnect on next use:', err?.message);
     });
 }
 
@@ -92,6 +134,60 @@ function clearCursorInternal() {
         console.error('[DB] Error clearing cursor:', err.message);
     }
 }
+
+// ── samsara_poll_state: read once per key, written only when it changes ─────
+// key → the value this process last READ from, or successfully WROTE to, the
+// table. Only this service writes these keys, so once a key has been read the
+// table can hold nothing this map does not already know; re-reading every
+// poll was ~3.3 SELECTs a minute that could never return anything new.
+//
+// A write goes to the table only when the value differs from the map, and the
+// map changes only after the write SUCCEEDED, so a failed write is retried the
+// next time instead of being taken for one that landed. There is deliberately
+// NO time-based throttle: a watermark lagging the alerts already sent widens
+// the window re-scanned after a crash, and only dedupe would then stand
+// between that window and a re-sent alert.
+const pollStateCache = new Map();
+
+/**
+ * One `samsara_poll_state` value. Null when the key has no row, when there is
+ * no database, or when the read failed — and a FAILED read is not remembered,
+ * so the next call asks the table again, exactly as every call used to.
+ */
+async function getPollState(key) {
+    if (pollStateCache.has(key)) return pollStateCache.get(key);
+    if (!pgPool) return null;
+    try {
+        const res = await pgPool.query('SELECT value FROM samsara_poll_state WHERE key = $1', [key]);
+        const value = res.rows[0]?.value || null;
+        pollStateCache.set(key, value);
+        return value;
+    } catch (err) {
+        console.error(`[DB] getPollState(${key}) error:`, err.message);
+        return null;
+    }
+}
+
+/** Write one `samsara_poll_state` value through to the table, if it changed. */
+async function savePollState(key, value) {
+    if (!value || !pgPool) return;
+    if (pollStateCache.get(key) === value) return;
+    try {
+        await pgPool.query(
+            `INSERT INTO samsara_poll_state (key, value, updated_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (key) DO UPDATE
+             SET value = EXCLUDED.value,
+                 updated_at = NOW()`,
+            [key, value]
+        );
+        pollStateCache.set(key, value);
+    } catch (err) {
+        console.error(`[DB] savePollState(${key}) error:`, err.message);
+    }
+}
+
+const POLL_WATERMARK_KEY = 'last_successful_poll_end_time';
 
 module.exports = {
     /**
@@ -191,38 +287,27 @@ module.exports = {
         clearCursorInternal();
     },
 
+    getPollState,
+    savePollState,
+
     /**
      * Persisted fallback watermark for time-window polling.
      * Stored in Postgres so it survives restarts on ephemeral filesystems.
      */
     async getPollWatermark() {
         if (cachedPollWatermark) return cachedPollWatermark;
-        if (!pgPool) return null;
-        try {
-            const res = await pgPool.query('SELECT value FROM samsara_poll_state WHERE key = $1', ['last_successful_poll_end_time']);
-            cachedPollWatermark = res.rows[0]?.value || null;
-            return cachedPollWatermark;
-        } catch (err) {
-            console.error('[DB] getPollWatermark error:', err.message);
-            return null;
-        }
+        cachedPollWatermark = await getPollState(POLL_WATERMARK_KEY);
+        return cachedPollWatermark;
     },
 
     async savePollWatermark(isoTime) {
         if (!isoTime || !pgPool) return;
+        // The poller moves on even if the write below fails, as it always has;
+        // the table catches up on the next successful write. That is why this
+        // is kept apart from the cache inside savePollState, which tracks only
+        // what the table actually holds.
         cachedPollWatermark = isoTime;
-        try {
-            await pgPool.query(
-                `INSERT INTO samsara_poll_state (key, value, updated_at)
-                 VALUES ($1, $2, NOW())
-                 ON CONFLICT (key) DO UPDATE
-                 SET value = EXCLUDED.value,
-                     updated_at = NOW()`,
-                ['last_successful_poll_end_time', isoTime]
-            );
-        } catch (err) {
-            console.error('[DB] savePollWatermark error:', err.message);
-        }
+        await savePollState(POLL_WATERMARK_KEY, isoTime);
     },
 
     async initPgDb() {

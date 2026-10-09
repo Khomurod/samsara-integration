@@ -8,6 +8,8 @@
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const { createSamsaraSettingsStore, envConfig, DEFAULTS } = require('../src/samsaraSettings');
 const { encryptShared, fingerprint } = require('../src/sharedIntegrationCrypto');
@@ -194,4 +196,68 @@ test('a saved value does override the environment — that is the point', async 
     assert.equal(cfg.maxVideoMegabytes, 30);
     assert.equal(cfg.videoRecoveryEnabled, true, 'FALSE in the environment is not a veto on THIS reader');
   });
+});
+
+// ── how often the row is read, and what comes back (Supabase egress) ─────────
+
+/** A pool that records every statement it is sent. */
+function recordingPool(answer) {
+  const statements = [];
+  return {
+    statements,
+    query: async (sql) => {
+      statements.push(String(sql));
+      return answer();
+    },
+  };
+}
+
+test('the row is re-read every five minutes, not every thirty seconds', async () => {
+  const pool = recordingPool(() => ({ rows: [{ enabled: true }] }));
+  const store = createSamsaraSettingsStore({ pool, log: silentLog });
+
+  await store.load({ now: 0 });
+  await store.load({ now: 30_000 });
+  await store.load({ now: 299_999 });
+  assert.equal(pool.statements.length, 1,
+    'the old 30 s cache read it ~1.65 times a minute, on every poll path');
+
+  await store.load({ now: 300_000 });
+  assert.equal(pool.statements.length, 2, 'a change saved in the panel still lands within five minutes');
+});
+
+test('a FAILED read is retried after 30 s, and the recovered row is then kept for five minutes', async () => {
+  let failing = true;
+  const pool = recordingPool(() => {
+    if (failing) throw new Error('connection terminated');
+    return { rows: [{ enabled: false }] };
+  });
+  const store = createSamsaraSettingsStore({ pool, log: silentLog });
+
+  assert.equal((await store.load({ now: 0 })).source, 'environment');
+  failing = false;
+  assert.equal((await store.load({ now: 29_999 })).source, 'environment');
+
+  const recovered = await store.load({ now: 30_000 });
+  assert.equal(recovered.source, 'database',
+    'a transient error must not hold the environment fallback for five minutes');
+  assert.equal(recovered.enabled, false, 'an operator who switched Samsara off is obeyed again');
+
+  await store.load({ now: 30_000 + 299_999 });
+  assert.equal(pool.statements.length, 2);
+});
+
+test('the row is read BY NAME — exactly the columns mapRow uses, never SELECT *', async () => {
+  const pool = recordingPool(() => ({ rows: [] }));
+  await createSamsaraSettingsStore({ pool, log: silentLog }).load();
+  const sql = pool.statements[0];
+
+  assert.doesNotMatch(sql, /SELECT\s+\*/i);
+  assert.match(sql, /FROM samsara_settings WHERE id = 1/);
+  const selected = sql.match(/SELECT([\s\S]*?)FROM/i)[1].split(',').map((c) => c.trim()).sort();
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'samsaraSettings.js'), 'utf8');
+  const read = [...new Set([...source.matchAll(/\brow\.([a-z_]+)/g)].map((m) => m[1]))].sort();
+  assert.deepEqual(selected, read,
+    'a column mapRow reads but the query omits is silently undefined, so the environment '
+    + 'would quietly win over the admin panel');
 });
