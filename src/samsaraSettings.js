@@ -17,14 +17,34 @@
  * service runs exactly as it did before — a settings problem must never stop
  * safety-event monitoring.
  *
- * The row is cached briefly: it is read on the polling path, and a change
- * should still land within about a minute.
+ * The row is cached for FIVE MINUTES, so a change saved in the panel lands
+ * within five minutes. It is read on the polling path, and the old 30 s cache
+ * re-read it ~1.65 times a minute — egress the Supabase Free plan cannot spare
+ * for a row that rarely changes. A read that FAILED is retried after 30 s, as
+ * before, so a transient database error never holds the environment fallback
+ * in place for the full five minutes.
  */
 
 const { safeDecryptShared, fingerprint, isAvailable } = require('./sharedIntegrationCrypto');
 
-const CACHE_TTL_MS = 30_000;
+const CACHE_TTL_MS = 5 * 60_000;
+const FAILED_READ_TTL_MS = 30_000;
 const DEFAULT_API_BASE = 'https://api.samsara.com';
+
+/**
+ * Exactly the columns `mapRow` reads, rather than `SELECT *` (which also
+ * shipped `id`, `api_key_last4`, `updated_by` and `updated_at`). Every one has
+ * existed since bot-backend migration 0013 created the table. A column the hub
+ * adds later is not read here until it is listed — and listing one the table
+ * does not have yet makes the whole read fail over to the environment.
+ */
+const SETTINGS_SELECT_SQL = `SELECT enabled, api_key_encrypted, api_key_fingerprint, api_base,
+       speeding_events_enabled, max_video_megabytes,
+       video_recovery_enabled, video_recovery_initial_delay_seconds,
+       video_retrieval_enabled, video_recovery_retry_interval_seconds,
+       video_recovery_max_attempts,
+       video_retrieval_window_before_seconds, video_retrieval_window_after_seconds
+  FROM samsara_settings WHERE id = 1`;
 
 /**
  * Shipped defaults. These must match bot-backend/database/samsaraSettings.js —
@@ -185,11 +205,12 @@ function createSamsaraSettingsStore({ pool, log = console } = {}) {
   async function load({ now = Date.now() } = {}) {
     if (cache && now < cacheExpiresAt) return cache;
     let effective;
+    let ttl = CACHE_TTL_MS;
     if (!pool) {
       effective = envConfig();
     } else {
       try {
-        const res = await pool.query('SELECT * FROM samsara_settings WHERE id = 1');
+        const res = await pool.query(SETTINGS_SELECT_SQL);
         effective = res.rows[0] ? mapRow(res.rows[0]) : envConfig();
       } catch (err) {
         if (!warnedNoTable) {
@@ -197,10 +218,11 @@ function createSamsaraSettingsStore({ pool, log = console } = {}) {
           log.warn?.(`[SamsaraSettings] Cannot read samsara_settings (${err.message}); using environment configuration.`);
         }
         effective = envConfig();
+        ttl = FAILED_READ_TTL_MS;
       }
     }
     cache = effective;
-    cacheExpiresAt = now + CACHE_TTL_MS;
+    cacheExpiresAt = now + ttl;
     return effective;
   }
 

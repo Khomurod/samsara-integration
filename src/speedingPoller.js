@@ -4,21 +4,24 @@
  * Keeps isolated state/dedup so legacy /fleet/safety-events flow is untouched.
  */
 
-const fs = require('fs');
-const path = require('path');
-const { Pool } = require('pg');
-
 const { formatAlert } = require('./formatter');
 const { reverseGeocode } = require('./geocoder');
 const { enqueueFormattedAlert } = require('./videoRetryDelivery');
 const { loadSamsaraConfig } = require('./samsaraSettings');
+const {
+  getPollState,
+  savePollState,
+  isSpeedingEventProcessed,
+  markSpeedingEventProcessed,
+} = require('./speedingPollState');
 
 // ── The Samsara credential, base URL and the speeding switch ─────────────────
 // MUTABLE, and `executePoll` is their only writer. They start as the
 // environment variables this service has always used and are refreshed from the
 // admin-panel settings row at the top of every poll, so replacing the API key
-// or turning speeding events off in the panel takes effect within a cycle
-// instead of needing a redeploy.
+// or turning speeding events off in the panel takes effect once the settings
+// cache expires (at most five minutes, src/samsaraSettings.js) instead of
+// needing a redeploy.
 let SAMSARA_API_KEY = process.env.SAMSARA_API_KEY;
 let SAMSARA_API_BASE = process.env.SAMSARA_API_BASE || 'https://api.samsara.com';
 let SPEEDING_ENABLED = process.env.SAMSARA_SPEEDING_ENABLED !== 'false';
@@ -54,18 +57,6 @@ const SPEEDING_LABELS = [
 
 const CURSOR_KEY = 'speeding_stream_cursor';
 const WATERMARK_KEY = 'speeding_stream_last_end_time';
-const PROCESSED_PREFIX = 'speed:';
-
-const DATA_DIR = path.join(__dirname, '..', 'data');
-const STATE_JSON = path.join(DATA_DIR, 'speeding-stream-state.json');
-
-let pgPool = null;
-if (process.env.DATABASE_URL) {
-  pgPool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false },
-  });
-}
 
 const ALERT_QUEUE = [];
 let isProcessingQueue = false;
@@ -87,107 +78,6 @@ const VEHICLE_CACHE_TTL_MS = 10 * 60 * 1000;
 
 let intervalId = null;
 let metricsIntervalId = null;
-
-function ensureDataDir() {
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  } catch (err) {
-    console.error('[SpeedPoller] Failed creating data dir:', err.message);
-  }
-}
-
-function getJsonState() {
-  ensureDataDir();
-  try {
-    if (!fs.existsSync(STATE_JSON)) return {};
-    return JSON.parse(fs.readFileSync(STATE_JSON, 'utf8'));
-  } catch (err) {
-    console.error('[SpeedPoller] JSON state read error:', err.message);
-    return {};
-  }
-}
-
-function saveJsonState(patch) {
-  const state = getJsonState();
-  const next = { ...state, ...patch };
-  ensureDataDir();
-  try {
-    fs.writeFileSync(STATE_JSON, JSON.stringify(next));
-  } catch (err) {
-    console.error('[SpeedPoller] JSON state write error:', err.message);
-  }
-}
-
-async function getPollState(key) {
-  if (pgPool) {
-    try {
-      const res = await pgPool.query('SELECT value FROM samsara_poll_state WHERE key = $1', [key]);
-      return res.rows[0]?.value || null;
-    } catch (err) {
-      console.error('[SpeedPoller] getPollState error:', err.message);
-      return null;
-    }
-  }
-  const state = getJsonState();
-  return state[key] || null;
-}
-
-async function savePollState(key, value) {
-  if (!value) return;
-  if (pgPool) {
-    try {
-      await pgPool.query(
-        `INSERT INTO samsara_poll_state (key, value, updated_at)
-         VALUES ($1, $2, NOW())
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-        [key, value],
-      );
-      return;
-    } catch (err) {
-      console.error('[SpeedPoller] savePollState error:', err.message);
-      return;
-    }
-  }
-  saveJsonState({ [key]: value, updated_at: new Date().toISOString() });
-}
-
-async function isSpeedingEventProcessed(eventId) {
-  if (!eventId) return false;
-  const namespaced = `${PROCESSED_PREFIX}${eventId}`;
-  if (!pgPool) {
-    const state = getJsonState();
-    const list = Array.isArray(state.speeding_processed_ids) ? state.speeding_processed_ids : [];
-    return list.includes(namespaced);
-  }
-
-  try {
-    const res = await pgPool.query('SELECT id FROM samsara_processed_events WHERE id = $1', [namespaced]);
-    return res.rows.length > 0;
-  } catch (err) {
-    console.error('[SpeedPoller] isSpeedingEventProcessed error:', err.message);
-    return false;
-  }
-}
-
-async function markSpeedingEventProcessed(eventId) {
-  if (!eventId) return;
-  const namespaced = `${PROCESSED_PREFIX}${eventId}`;
-  if (!pgPool) {
-    const state = getJsonState();
-    const list = Array.isArray(state.speeding_processed_ids) ? state.speeding_processed_ids : [];
-    if (!list.includes(namespaced)) {
-      list.push(namespaced);
-      saveJsonState({ speeding_processed_ids: list.slice(-5000) });
-    }
-    return;
-  }
-
-  try {
-    await pgPool.query('INSERT INTO samsara_processed_events (id) VALUES ($1) ON CONFLICT DO NOTHING', [namespaced]);
-  } catch (err) {
-    console.error('[SpeedPoller] markSpeedingEventProcessed error:', err.message);
-  }
-}
 
 function queueAlert(formattedAlert) {
   if (!formattedAlert) return;

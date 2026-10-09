@@ -18,6 +18,8 @@
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const { createVideoRecoveryStore, _sql } = require('../src/videoRecoveryStore');
 
@@ -162,4 +164,66 @@ test('the mirrored DDL matches what the worker relies on', () => {
     _sql.CREATE_INDEXES_SQL.some((sql) => /next_check_at/.test(sql)),
     'the worker only ever asks "what is due now?" — that must be indexed',
   );
+});
+
+// ── what comes back over the wire (Supabase egress) ──────────────────────────
+
+const SRC = path.join(__dirname, '..', 'src');
+
+/** Every `job.<field>` src/videoRecoveryWorker.js reads, from its own source. */
+function fieldsTheWorkerReads() {
+  const source = fs.readFileSync(path.join(SRC, 'videoRecoveryWorker.js'), 'utf8');
+  return [...new Set([...source.matchAll(/\bjob\.([a-z_]+)/g)].map((m) => m[1]))].sort();
+}
+
+function returnedColumns(sql) {
+  return sql.match(/RETURNING\s+([\s\S]+?)\s*$/)[1].split(',').map((c) => c.trim()).sort();
+}
+
+test('the claim returns exactly the fields the worker reads — never RETURNING *', async () => {
+  // It runs every 30 s and is almost always empty, yet `RETURNING *` still sent
+  // a description of all nineteen columns every time.
+  const pool = recordingPool([{ rows: [] }]);
+  const store = createVideoRecoveryStore({ pool, log: silentLog });
+  await store.claimDueJobs({ limit: 3, now: new Date('2026-10-09T12:00:00.000Z') });
+  const { text } = pool.queries[0];
+
+  assert.doesNotMatch(text, /RETURNING\s+\*/);
+  const returned = returnedColumns(text);
+  const read = fieldsTheWorkerReads();
+  assert.deepEqual(read.filter((f) => !returned.includes(f)), [],
+    'a field the worker reads but the claim omits is undefined there — a lost retrieval id '
+    + 'or retrieval_requested_at is a second Samsara retrieval request for the same footage');
+  assert.deepEqual(returned, read, 'and nothing the worker never reads');
+});
+
+test('every other statement sends back only the id its caller checks', async () => {
+  const pool = recordingPool([
+    { rows: [{ id: '1' }] }, // reschedule
+    { rows: [{ id: '1' }] }, // finish
+    { rows: [{ id: '2' }] }, // enqueue, new
+    { rows: [] }, //            enqueue, conflicting…
+    { rows: [{ id: '2' }] }, // …so the existing job is looked up
+  ]);
+  const store = createVideoRecoveryStore({ pool, log: silentLog });
+
+  assert.ok(await store.reschedule(1, { status: 'pending_recheck', nextCheckAt: new Date() }));
+  assert.ok(await store.finish(1, { status: 'completed', targets: [] }),
+    'a recorded terminal state is still told apart from a missing row');
+  assert.equal((await store.enqueue({ eventId: 'evt-2', targets: [] })).created, true);
+  assert.deepEqual(await store.enqueue({ eventId: 'evt-2', targets: [] }), { created: false, job: { id: '2' } });
+
+  const returning = pool.queries.filter((q) => /RETURNING/.test(q.text));
+  assert.deepEqual(returning.map((q) => returnedColumns(q.text)), [['id'], ['id'], ['id'], ['id']],
+    'echoing raw_event and targets back after every step was pure egress');
+  assert.match(pool.queries[4].text, /^SELECT id FROM samsara_video_recovery_jobs/);
+});
+
+test('no statement in the recovery store asks for every column', () => {
+  // Comments may say why `RETURNING *` went; only the code is checked.
+  const code = fs.readFileSync(path.join(SRC, 'videoRecoveryStore.js'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  assert.doesNotMatch(code, /RETURNING\s+\*/);
+  assert.doesNotMatch(code, /SELECT\s+\*/);
 });
