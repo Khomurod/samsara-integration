@@ -72,7 +72,7 @@ SIGINT/SIGTERM.
 | `src/broadcastDelivery.js` | `deliverEvent()`: idempotent fan-out to subscribers + notifications group + matched driver group; consults/records the ledger; only re-throws on transient failure. |
 | `src/driverGroupDelivery.js` | Sends to a driver group with dual-camera → single-video → text fallback. |
 | `src/routing.js` | Unit-number extraction + name-hint matching, and `chooseRoutedGroup()` — the pure decision between a **stored** `groups.samsara_vehicle_id` link and a parsed one → target driver group or `fallback-*` reason. |
-| `src/routingFindings.js` | Writes one `operational_findings` row (bot-backend's table, shared database) when routing fell back to the string parse, or when the two answers disagreed. Never throws, degrades silently if the table is absent, always tier `warning` — this service may report, never correct. |
+| `src/routingFindings.js` | Writes one `operational_findings` row (bot-backend's table, shared database) when routing fell back to the string parse, or when the two answers disagreed — and, on every routed alert, resolves this poller's OTHER routing findings for that vehicle (they are no longer true). Never throws, degrades silently if the table is absent, always tier `warning`, and closes only the three keys it files — this service may report, never correct. |
 | `src/deliveryTracker.js` | Thin ledger wrapper + `classifyTelegramError()` (permanent vs transient). |
 | `src/deliveryWarnings.js` | Appends a "driver bot not in group" note to notification messages. |
 
@@ -187,7 +187,12 @@ SIGINT/SIGTERM.
      the two is sending a safety alert to the wrong driver. Running the old path
      alongside the new one is the only reason that surfaces on day one instead of
      as a driver who quietly stops receiving alerts.
-5. No mapped group → `fallback-unmapped`, driver forward skipped (never sent to
+5. **A routed alert settles its vehicle's record** (`resolveRoutingFindings`):
+   the finding this alert filed stays open, the other routing findings for the
+   same vehicle are resolved. Until 20 October 2026 nothing closed them, and
+   four of nine "routed by name" findings described vehicles that had routed by
+   their stored link for weeks. An alert that reaches nobody settles nothing.
+6. No mapped group → `fallback-unmapped`, driver forward skipped (never sent to
    a wrong group). Matched → forwarded with an AI-friendly caption.
 
 The string parse is deliberately **not** removed. `groups.samsara_vehicle_id` is
