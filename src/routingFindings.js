@@ -5,8 +5,17 @@
  * may WRITE a finding — it is the only thing that knows how a live safety alert
  * was routed — but it must never apply a correction; that authority lives in
  * bot-backend behind the tiered registry, the audit trail and the reversal path.
- * So this file has exactly one statement, and it is an upsert of a `warning`-tier
- * row.
+ * So this file has exactly two statements: an upsert of a `warning`-tier row,
+ * and the close of this poller's OWN rows for a vehicle once they stop being
+ * true.
+ *
+ * WHY IT CLOSES ITS OWN. A routing finding says how one vehicle's alerts were
+ * routed. Nothing else knows when that changes, so nothing else closed them:
+ * on 20 October 2026, four of nine "routed by name" findings described
+ * vehicles that had routed by their stored link for weeks. Now every routed
+ * alert settles the record for its vehicle — the finding it files stays open,
+ * the other routing findings for that vehicle are resolved — and an alert
+ * that reaches nobody settles nothing.
  *
  * THREE WAYS THIS MUST NOT HURT ANYTHING:
  *
@@ -25,6 +34,13 @@
 
 /** Postgres: relation does not exist. */
 const UNDEFINED_TABLE = '42P01';
+
+/** Every key this poller files. These, and only these, it may also close. */
+const ROUTING_KEYS = Object.freeze([
+  'integrations.samsara_routed_by_name',
+  'integrations.samsara_routing_disagreement',
+  'integrations.samsara_vehicle_link_contested',
+]);
 
 let warnedMissingTable = false;
 
@@ -69,9 +85,38 @@ async function recordRoutingFinding(pool, finding, { log = console } = {}) {
   }
 }
 
+/**
+ * Resolve this vehicle's open routing findings, except the one just filed.
+ * Never throws, for the same reason the upsert never does.
+ *
+ * @returns {Promise<number>} how many were resolved
+ */
+async function resolveRoutingFindings(pool, subjectId, { except = null, log = console } = {}) {
+  if (!pool || !subjectId) return 0;
+  const keys = ROUTING_KEYS.filter((key) => key !== except);
+  try {
+    const res = await pool.query(
+      `UPDATE operational_findings
+          SET status = 'resolved', resolved_at = NOW(), updated_at = NOW()
+        WHERE check_key = ANY($1::text[])
+          AND subject_type = 'samsara_vehicle'
+          AND subject_id = $2
+          AND status = 'open'`,
+      [keys, String(subjectId)]
+    );
+    return res?.rowCount || 0;
+  } catch (err) {
+    if (err && err.code === UNDEFINED_TABLE) return 0;
+    log.error?.('[Routing] Failed to settle routing findings:', err.message);
+    return 0;
+  }
+}
+
 /** Test seam — the "warn once" latch is process-wide by design. */
 function resetMissingTableWarning() {
   warnedMissingTable = false;
 }
 
-module.exports = { recordRoutingFinding, resetMissingTableWarning, UNDEFINED_TABLE };
+module.exports = {
+  recordRoutingFinding, resolveRoutingFindings, resetMissingTableWarning, UNDEFINED_TABLE, ROUTING_KEYS,
+};

@@ -15,8 +15,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { chooseRoutedGroup } = require('../src/routing');
-const { recordRoutingFinding, resetMissingTableWarning, UNDEFINED_TABLE } = require('../src/routingFindings');
+const { chooseRoutedGroup, routingSubjectId } = require('../src/routing');
+const {
+  recordRoutingFinding, resolveRoutingFindings, resetMissingTableWarning, UNDEFINED_TABLE, ROUTING_KEYS,
+} = require('../src/routingFindings');
 
 const STORED = { id: 7, telegram_group_id: '-700', group_name: 'WENZE UNIT # 305 JOHN DOE' };
 const PARSED = { id: 9, telegram_group_id: '-900', group_name: 'WENZE 2021 UNIT # 2021 SOMEBODY', matchReason: 'unit' };
@@ -163,4 +165,40 @@ test('one claimant is an ordinary stored link, not a contradiction', () => {
   assert.equal(choice.group, STORED);
   assert.equal(choice.matchReason, 'vehicle_id');
   assert.equal(choice.finding, null);
+});
+
+// ─── a routed alert settles the record for its vehicle ───────────────────────
+
+test('settling closes this poller\'s OTHER routing findings for the vehicle, never anyone else\'s', async () => {
+  // 20 October 2026: four of nine "routed by name" rows described vehicles that
+  // had routed by their stored link for weeks. Nothing closed them.
+  const queries = [];
+  const pool = { query: async (text, values) => { queries.push([text, values]); return { rowCount: 1 }; } };
+  const n = await resolveRoutingFindings(pool, 'veh_1', { except: 'integrations.samsara_routing_disagreement' });
+  assert.equal(n, 1);
+  const [text, [keys, subject]] = queries[0];
+  assert.match(text, /SET status = 'resolved'/);
+  assert.match(text, /subject_type = 'samsara_vehicle'/);
+  assert.match(text, /status = 'open'/, 'a dismissed row is a person\'s decision and stays dismissed');
+  assert.equal(subject, 'veh_1');
+  assert.deepEqual(keys, ['integrations.samsara_routed_by_name', 'integrations.samsara_vehicle_link_contested'],
+    'the finding this alert just filed stays open');
+  assert.ok(keys.every((k) => ROUTING_KEYS.includes(k)), 'only keys this poller files');
+});
+
+test('settling never throws — the alert outranks the note', async () => {
+  const errors = [];
+  const pool = { query: async () => { throw new Error('connection terminated'); } };
+  assert.equal(await resolveRoutingFindings(pool, 'veh_1', { log: { error: (...a) => errors.push(a) } }), 0);
+  assert.equal(errors.length, 1);
+  const missing = { query: async () => { throw Object.assign(new Error('x'), { code: UNDEFINED_TABLE }); } };
+  assert.equal(await resolveRoutingFindings(missing, 'veh_1', { log: { error: () => { throw new Error('no'); } } }), 0);
+  assert.equal(await resolveRoutingFindings(pool, '', {}), 0, 'no vehicle, nothing to settle');
+});
+
+test('the finding\'s subject and the settle\'s subject are the same id', () => {
+  assert.equal(routingSubjectId({ vehicleId: 281475006981753 }), '281475006981753');
+  assert.equal(routingSubjectId({ unitNumber: '2021' }), 'unit:2021');
+  const choice = chooseRoutedGroup({ stored: null, parsed: PARSED, unitNumber: '2021' });
+  assert.equal(choice.finding.subjectId, routingSubjectId({ unitNumber: '2021' }));
 });

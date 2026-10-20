@@ -33,6 +33,11 @@ function resolveGroupByUnitAndName(candidates, unitNumber, nameHints = []) {
 }
 
 
+/** Which vehicle a routing finding is about: its Samsara id, or its unit when it has none. */
+function routingSubjectId({ vehicleId = null, unitNumber = null } = {}) {
+  return vehicleId ? String(vehicleId) : `unit:${unitNumber || 'unknown'}`;
+}
+
 /**
  * Which resolution wins, and what that says about the fleet's data. PURE.
  *
@@ -65,7 +70,7 @@ function chooseRoutedGroup({
   stored = null, parsed = null, contestedStored = null,
   vehicleId = null, vehicleName = '', unitNumber = null,
 } = {}) {
-  const subjectId = vehicleId ? String(vehicleId) : `unit:${unitNumber || 'unknown'}`;
+  const subjectId = routingSubjectId({ vehicleId, unitNumber });
 
   // A VEHICLE TWO GROUPS BOTH CLAIM IS NOT A MISSING LINK, and the difference
   // matters: falling silently back to the name parse would hide a contradiction
@@ -196,6 +201,7 @@ async function determineTargetGroup(alertData, resolveGroupByUnit, managementGro
 
 module.exports = {
   chooseRoutedGroup,
+  routingSubjectId,
   extractUnitNumber,
   normalizeName,
   resolveGroupByUnitAndName,

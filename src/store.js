@@ -11,9 +11,9 @@
 const fs = require('fs');
 const path = require('path');
 const {
-  extractUnitNumber, normalizeName, resolveGroupByUnitAndName, chooseRoutedGroup,
+  extractUnitNumber, normalizeName, resolveGroupByUnitAndName, chooseRoutedGroup, routingSubjectId,
 } = require('./routing');
-const { recordRoutingFinding } = require('./routingFindings');
+const { recordRoutingFinding, resolveRoutingFindings } = require('./routingFindings');
 
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -209,6 +209,11 @@ module.exports = {
         await recordRoutingFinding(pool, choice.finding);
       }
       if (!choice.group) return null;
+      // A routed alert settles the record for its vehicle: whatever routing
+      // finding this alert did not file is no longer true.
+      await resolveRoutingFindings(pool, routingSubjectId({ vehicleId, unitNumber }), {
+        except: choice.finding?.checkKey || null,
+      });
 
       return {
         // The internal id as well as the chat id: `driver_safety_events` keys on
