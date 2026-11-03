@@ -44,6 +44,7 @@ index.js ── Express (/health) + notification bot + send-only driverBot + pol
        ├── Recovery     videoRecoveryStore.js · videoRecoveryWorker.js
        ├── Settings     samsaraSettings.js · sharedIntegrationCrypto.js
        ├── AI           driverAlertMessageAi.js · geminiClient.js · groqClient.js
+       ├── Hosting      telegramNetwork.js · standby.js
        └── Shared       db.js · store.js · formatter.js · geocoder.js
 Shares: Postgres `groups` table + Telegram tokens with bot-backend
 ```
@@ -112,6 +113,12 @@ SIGINT/SIGTERM.
 | `src/store.js` | Subscriber storage (Upstash Redis or local JSON fallback) + `findGroupByUnit()`: runs the stored-id lookup **and** the name parse, prefers the stored link, files a finding whenever the parse was the one that answered. |
 | `src/formatter.js` | Raw Samsara payload → human-readable HTML Telegram message. |
 | `src/geocoder.js` | Reverse-geocode lat/lon → "City, State" (BigDataCloud) when Samsara omits an address. |
+
+### Hosting
+| File | Responsibility |
+|---|---|
+| `src/telegramNetwork.js` | Every Telegram call over IPv4 (one keep-alive agent handed to both bots; node-telegram-bot-api passes it into API calls, multipart uploads and file downloads), and IPv4-first DNS for everything else. The Hostinger VPS black-holes large request bodies over IPv6 — sendVideo would stall. Harmless on Render. |
+| `src/standby.js` | `SAMSARA_STANDBY=true`: up and silent — no Telegram or Samsara polling, no posts, no video recovery, no heartbeat — plus a read-only preflight (database, migration 0090, Samsara key and API, both bots, a 256 KB upload probe to `getMe`, ffmpeg) reported on `/health` (always 200 in standby). How the service moves host without two copies ever running at once: `docs/deployment/coolify.md`. |
 
 ## Idempotency — three layers (do not weaken)
 
@@ -213,6 +220,8 @@ is always included so every event lands there regardless of routing.
 (Root `test-*.js` are manual live/mock scripts, **not** part of `npm test`.)
 
 ## Deployment
+Moving to the Hostinger VPS (Coolify, `Dockerfile`, standby first): the runbook
+is `docs/deployment/coolify.md`. Until the switch, and as the rollback after it:
 Render `render.yaml`: one `web` service `samsara-poller`
 (`buildCommand: npm install`, `startCommand: node index.js`,
 `healthCheckPath: /health`). Key env: `SAMSARA_BOT_TOKEN`/`TELEGRAM_BOT_TOKEN`,

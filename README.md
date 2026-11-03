@@ -297,6 +297,7 @@ Samsara API — just provide a valid API key with at minimum **Read** access to
 | `USE_WEBHOOK`               | ❌       | Set to `true` to use Telegram webhook mode instead of long-polling  |
 | `PUBLIC_WEBHOOK_URL`        | ❌       | Your public HTTPS URL (needed if `USE_WEBHOOK=true`)                |
 | `RENDER_EXTERNAL_URL`       | ❌       | Auto-set by Render, used as fallback for the webhook URL            |
+| `SAMSARA_STANDBY`           | ❌       | `true` = up and silent (no polling, no posts), preflight on `/health` — for moving host (`docs/deployment/coolify.md`) |
 | `PORT` / `WEBHOOK_PORT`     | ❌       | Express server port (default: `3000`)                               |
 
 > **Without Upstash Redis**, subscribers are stored in `data/subscribers.json` on the
@@ -382,6 +383,15 @@ A `✗ … CANNOT access …` line means the wrong token is configured or the bo
 isn't in the group.
 
 ---
+
+## Moving to the Hostinger VPS (Coolify)
+
+The service can run next to the hub on the Hostinger VPS as its own Coolify
+application (repository `Dockerfile`), where it never sleeps. The move uses
+**standby** (`SAMSARA_STANDBY=true`: up, preflight-checked, silent) so two
+copies never run at once and nobody notices the switch. Every Telegram call
+goes over IPv4, because the VPS black-holes large request bodies over IPv6.
+Runbook: [`docs/deployment/coolify.md`](docs/deployment/coolify.md).
 
 ## Keeping the free Render instance awake
 

@@ -1,0 +1,18 @@
+# The image installs its own dependencies.
+node_modules
+
+# Local fallback state (cursor, subscribers). On the host it lives on a
+# persistent volume at /app/data; a developer's copy must never ship.
+data
+
+# Secrets stay in the platform's environment, never in the image.
+.env
+.env.*
+!.env.example
+
+# Not needed at runtime.
+.git
+.github
+.claude
+tests
+*.log

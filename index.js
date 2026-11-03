@@ -10,6 +10,18 @@ require('dotenv').config();
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 
+// IPv4 first, before anything opens a connection: the VPS this service runs on
+// black-holes large request bodies over IPv6 (src/telegramNetwork.js).
+const { telegramBotOptions, telegramIpv4Agent, preferIpv4 } = require('./src/telegramNetwork');
+preferIpv4();
+
+// STANDBY: up, preflight-checked, and silent — no polling, no posting, no
+// heartbeat. How this service moves host without two copies ever running at
+// once (src/standby.js, docs/deployment/coolify.md).
+const standby = require('./src/standby');
+const STANDBY = standby.isStandby();
+let standbyPreflight = null;
+
 const coordinator = require('./src/pollCoordinator');
 const store = require('./src/store');
 const samsaraDb = require('./src/db');
@@ -133,6 +145,12 @@ app.get('/health', (req, res) => {
     // Lightweight, in-memory only (no DB / network) so an uptime monitor can call
     // it every few minutes safely. Reports real poll liveness, not just that
     // Express is up, and returns 503 when polling has gone stale/stopped.
+    if (STANDBY) {
+        // Idle on purpose: the preflight's answers instead of poll liveness.
+        const report = standby.buildStandbyHealth({ preflight: standbyPreflight, uptimeSeconds: process.uptime() });
+        res.status(report.statusCode).json(report.body);
+        return;
+    }
     try {
         const report = buildHealthReport({
             now: Date.now(),
@@ -333,21 +351,23 @@ let bot;
 let driverBot;
 
 if (USE_WEBHOOK) {
-    bot = new TelegramBot(TOKEN, { polling: false });
+    bot = new TelegramBot(TOKEN, telegramBotOptions({ polling: false }));
     const telegramWebhookPath = `/telegram-webhook/${TOKEN}`;
     app.post(telegramWebhookPath, (req, res) => {
         bot.processUpdate(req.body);
         res.sendStatus(200);
     });
 } else {
-    bot = new TelegramBot(TOKEN, { polling: true });
+    // In standby the notification bot never long-polls: getUpdates belongs to
+    // the copy that is live, and a second consumer is Telegram's 409 Conflict.
+    bot = new TelegramBot(TOKEN, telegramBotOptions({ polling: !STANDBY }));
 }
 
 // Initialize Driver Bot (Main / feedback bot token ? send-only)
 const MAIN_BOT_TOKEN = resolvedMainBotToken;
 if (MAIN_BOT_TOKEN) {
     console.log('[Bot] Initializing driverBot with main BOT_TOKEN');
-    driverBot = new TelegramBot(MAIN_BOT_TOKEN, { polling: false });
+    driverBot = new TelegramBot(MAIN_BOT_TOKEN, telegramBotOptions({ polling: false }));
 }
 
 const poller = require('./src/poller');
@@ -424,7 +444,7 @@ async function start() {
     console.log(`? Express server listening on port ${PORT} (Health checks)`);
     console.log(`?? Subscribers loaded: ${store.count()}`);
 
-    if (USE_WEBHOOK && SELF_URL) {
+    if (USE_WEBHOOK && SELF_URL && !STANDBY) {
         const telegramWebhookUrl = `${SELF_URL}/telegram-webhook/${TOKEN}`;
         try {
             await bot.setWebHook(telegramWebhookUrl);
@@ -447,13 +467,17 @@ async function start() {
             });
         }, 14 * 60 * 1000);
 
+    } else if (STANDBY) {
+        console.log('[Standby] SAMSARA_STANDBY is on: Telegram is NOT polled and nothing will be posted.');
     } else {
         console.log(`? Telegram bot is online (long-polling mode)`);
     }
 
-    console.log('');
-    console.log('?? Bot is ready! Send /start to @wenzesambot on Telegram');
-    console.log('');
+    if (!STANDBY) {
+        console.log('');
+        console.log('?? Bot is ready! Send /start to @wenzesambot on Telegram');
+        console.log('');
+    }
 
     // Best-effort self-check: confirm WHICH bot we are and whether it can
     // actually reach the hardcoded "Samsara Notifications" group. This makes a
@@ -468,6 +492,27 @@ async function start() {
     // Missing-video recovery, and what it is configured to do. Logged without
     // the key so "why is nothing being recovered?" is answerable from the log.
     await logVideoRecoveryReadiness();
+
+    if (STANDBY) {
+        // Everything above only read, or ensured tables that already exist (the
+        // same idempotent statements every boot runs). Prove the rest, then
+        // stay idle: no video recovery, no polling, no heartbeat — the live
+        // copy owns all of them.
+        standbyPreflight = await standby.runPreflight(standby.defaultChecks({
+            pool: samsaraDb.getPgPool(),
+            settingsStore: samsaraSettings,
+            notificationBot: bot,
+            driverBot,
+            notificationToken: TOKEN,
+            forcedGroupId: process.env.HARDCODED_GROUP_ID || '-5192934125',
+            ffmpeg: driverVideoProcessor.ffmpeg,
+            agent: telegramIpv4Agent,
+        }), { secrets: [TOKEN, MAIN_BOT_TOKEN] });
+        standby.logPreflight(standbyPreflight);
+        console.log('[Standby] Idle. To go live: stop the old host, set SAMSARA_STANDBY=false, restart.');
+        return;
+    }
+
     videoRecoveryWorker.start();
 
     // Start coordinated polling
