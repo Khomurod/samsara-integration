@@ -64,6 +64,9 @@ function saveToDisk(set) {
 
 // In-memory cache — always stores chat IDs as STRINGS for consistency
 let cache = new Set(loadFromDisk().map(String));
+// Whether the shared Upstash list was actually read at startup (always true
+// when Upstash is not configured: there is nothing shared to load).
+let upstashLoaded = !USE_REDIS;
 
 // Helper: normalize Redis response to an array of strings
 function normalizeMembers(members) {
@@ -155,6 +158,19 @@ module.exports = {
   },
 
   /**
+   * Where the list lives: 'upstash' (shared, survives anything) or
+   * 'local-file' (this host's data/subscribers.json only).
+   */
+  backend() {
+    return USE_REDIS ? 'upstash' : 'local-file';
+  },
+
+  /** False when Upstash is configured but the startup read failed. */
+  loadedFromUpstash() {
+    return upstashLoaded;
+  },
+
+  /**
    * Load all subscribers from Redis into cache on startup.
    * Ensures all IDs are stored as strings for consistent lookups.
    */
@@ -164,6 +180,7 @@ module.exports = {
         const members = await redis.smembers(REDIS_KEY);
         const normalized = normalizeMembers(members);
         cache = new Set(normalized);
+        upstashLoaded = true;
         console.log(`[Store] Loaded ${cache.size} subscriber(s) from Redis: [${normalized.join(', ')}]`);
       } catch (err) {
         console.error('[Store] Failed to load from Redis on init:', err.message);

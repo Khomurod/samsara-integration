@@ -76,8 +76,16 @@
 | Redis (Upstash) | Falls back to local JSON subscriber store. | **[MANUAL]** confirm `store.js` fallback path. |
 | Database | Startup fails loudly; dedupe relies on Postgres — must be available. | **[PROD]** `/health`; confirm `DATABASE_URL`. |
 
+## H. Moving host (Render → Hostinger VPS)
+| # | What / Why | How to check |
+|---|---|---|
+| H1 | Never two copies at once (409 on the bot, two pollers posting). | **[MANUAL]** the new host starts with `SAMSARA_STANDBY=true`; the old one is suspended BEFORE standby is turned off. |
+| H2 | The new host can do everything the live service needs. | **[PROD]** `/health` in standby: `"ready": true`, every preflight check ✓ (`docs/deployment/coolify.md`). |
+| H3 | Videos reach Telegram from the VPS (its IPv6 route black-holes uploads). | **[AUTO]** `telegramNetwork.test.js` (the IPv4 agent reaches every call, uploads included); **[PROD]** preflight `telegramUpload` ✓, then the first real alert arrives with its video. |
+| H4 | Rollback is lossless. | **[MANUAL]** stop the new copy, resume the old: all state is in the shared database. |
+
 ## G. Deployment (run in order)
-1. ☐ **[AUTO]** `node --test --test-concurrency=1 tests/*.test.js` → all pass (currently 71).
+1. ☐ **[AUTO]** `node --test --test-concurrency=1 tests/*.test.js` → all pass (currently 285).
 2. ☐ **[AUTO]** Lint/typecheck: *none configured* — N/A.
 3. ☐ **[AUTO]** Build: *no build step* (plain Node) — N/A.
 4. ☐ **[MANUAL]** No schema migration is owned here; the `groups` table is owned by `bot-backend`. If a `groups` change is needed, coordinate with that repo first.
