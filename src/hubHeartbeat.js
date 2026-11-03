@@ -16,6 +16,12 @@
  * driver, no vehicle, no media URL, no API key — the hub publishes this row on
  * a public health endpoint.
  *
+ * AND ONE CAPABILITY, on every beat: `driverGroupSwitch: true` says this build
+ * honours the per-driver switch set in Wenze (`groups.samsara_driver_alerts_enabled`,
+ * src/driverGroupSwitch.js). The hub's Driver Groups screen reads it to say
+ * whether Off is really applied, instead of claiming so while an older build of
+ * this service is still posting. A build without it simply never writes it.
+ *
  * IT IS BEST-EFFORT AND SILENT ON FAILURE. A heartbeat that can break the poll
  * it reports on is worse than no heartbeat: the poll is the product and this is
  * a comment on it. A database without the ledger table (a hub that has not
@@ -26,6 +32,9 @@ const { getPgPool } = require('./db');
 const SERVICE_KEY = 'samsara_safety_pipeline';
 /** How often the hub should expect to hear from this service, in seconds. */
 const EXPECTED_INTERVAL_SECONDS = 3600;
+
+/** What this build does that the hub may need to know. Booleans only. */
+const CAPABILITIES = Object.freeze({ driverGroupSwitch: true });
 
 let lastFailure = null;
 
@@ -39,6 +48,7 @@ async function beat(status, { detail = null, summary = null } = {}) {
   const pool = getPgPool();
   if (!pool) return false;
   const failed = status === 'error';
+  const fullSummary = { ...(summary || {}), ...CAPABILITIES };
   try {
     await pool.query(
       `INSERT INTO background_service_runs
@@ -65,7 +75,7 @@ async function beat(status, { detail = null, summary = null } = {}) {
       [
         SERVICE_KEY, status,
         detail ? String(detail).slice(0, 300) : null,
-        summary ? JSON.stringify(summary) : null,
+        JSON.stringify(fullSummary),
         failed, EXPECTED_INTERVAL_SECONDS,
       ]
     );
@@ -87,4 +97,4 @@ function heartbeatStatus() {
   return { serviceKey: SERVICE_KEY, configured: Boolean(getPgPool()), lastFailure };
 }
 
-module.exports = { SERVICE_KEY, EXPECTED_INTERVAL_SECONDS, beat, heartbeatStatus };
+module.exports = { SERVICE_KEY, EXPECTED_INTERVAL_SECONDS, CAPABILITIES, beat, heartbeatStatus };

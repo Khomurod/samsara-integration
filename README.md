@@ -430,7 +430,9 @@ NOT call each other directly. They cooperate through two shared things:
    switch on the admin's Driver Groups page (`src/driverGroupSwitch.js`). OFF
    stops only that group's copy (and any recovered video into it); the
    notifications group, subscribers and the safety-event record are unchanged.
-   A database without the column yet reads as ON.
+   A database without the column yet reads as ON. Every heartbeat this service
+   writes says `driverGroupSwitch: true`, which is how the admin screen knows
+   the switch is really applied (it says "saved, but not applied yet" until then).
 2. **The same Telegram bot tokens.** `BOT_TOKEN` (the main feedback bot) posts
    the video + friendly caption into the driver group; `TELEGRAM_BOT_TOKEN`
    (the Samsara bot) sends the Samsara notification group / subscribers.
