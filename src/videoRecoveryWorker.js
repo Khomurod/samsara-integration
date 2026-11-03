@@ -34,6 +34,7 @@ const {
 } = require('./cameraMediaRetrieval');
 const { refetchVideoUrlsViaFleetWindow } = require('./safetyEventMedia');
 const { runVideoBackfill } = require('./videoBackfill');
+const { sortTargetsBySwitch } = require('./driverGroupSwitch');
 
 const DEFAULT_TICK_MS = 30_000;
 const DEFAULT_BATCH = 3;
@@ -62,6 +63,9 @@ function createVideoRecoveryWorker({
   resolveBot,
   makeGetVideoBuffer,
   prepareDriverVideo = null,
+  // The per-driver switch set in Wenze (src/driverGroupSwitch.js). Defaults to
+  // "on", which is how every recovery ran before the switch existed.
+  isDriverGroupAlertsEnabled = async () => true,
   refetchEventUrls = refetchVideoUrlsViaFleetWindow,
   tickMs = DEFAULT_TICK_MS,
   batchSize = DEFAULT_BATCH,
@@ -187,15 +191,17 @@ function createVideoRecoveryWorker({
    * received it can never get a second copy.
    */
   async function deliverVideo(job, urls) {
-    const targets = Array.isArray(job.targets) ? job.targets : [];
+    // A driver group switched off in Wenze since the alert went out is done
+    // with; one whose switch could not be read waits for the next attempt.
+    const { send: targets, held } = await sortTargetsBySwitch(job.targets, isDriverGroupAlertsEnabled, log);
     if (!targets.length) {
-      return { posted: 0, attempted: 0, failedTargets: [] };
+      return { posted: 0, attempted: 0, failedTargets: held };
     }
     const getVideoBuffer = typeof makeGetVideoBuffer === 'function' ? makeGetVideoBuffer() : null;
     if (!getVideoBuffer) {
-      return { posted: 0, attempted: 0, failedTargets: targets, error: 'no video downloader available' };
+      return { posted: 0, attempted: 0, failedTargets: [...targets, ...held], error: 'no video downloader available' };
     }
-    return runVideoBackfill({
+    const result = await runVideoBackfill({
       sentMessages: targets,
       videoUrls: urls,
       resolveBot,
@@ -205,6 +211,7 @@ function createVideoRecoveryWorker({
       eventId: job.samsara_event_id,
       log,
     });
+    return { ...result, failedTargets: [...(result.failedTargets || []), ...held] };
   }
 
   /**

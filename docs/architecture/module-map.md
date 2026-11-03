@@ -38,7 +38,7 @@ index.js ── Express (/health) + notification bot + send-only driverBot + pol
   └── src/
        ├── Polling      poller.js · speedingPoller.js · speedingPollState.js · pollCoordinator.js
        ├── Delivery     broadcastDelivery.js · driverGroupDelivery.js · routing.js
-       │                deliveryTracker.js · deliveryWarnings.js
+       │                driverGroupSwitch.js · deliveryTracker.js · deliveryWarnings.js
        ├── Video        safetyEventMedia.js · videoBackfill.js · videoRetryDelivery.js
        │                cameraMediaRetrieval.js · videoUrl.js
        ├── Recovery     videoRecoveryStore.js · videoRecoveryWorker.js
@@ -71,6 +71,7 @@ SIGINT/SIGTERM.
 |---|---|
 | `src/broadcastDelivery.js` | `deliverEvent()`: idempotent fan-out to subscribers + notifications group + matched driver group; consults/records the ledger; only re-throws on transient failure. |
 | `src/driverGroupDelivery.js` | Sends to a driver group with dual-camera → single-video → text fallback. |
+| `src/driverGroupSwitch.js` | The per-driver switch set in Wenze (Driver Groups → driver details), `groups.samsara_driver_alerts_enabled`: read before every post into a driver group and before a recovered video goes into one. OFF stops only that group's copy; a missing column reads ON; an unreadable switch throws so the caller retries rather than guesses. bot-backend `docs/architecture/samsara-driver-group-alerts.md`. |
 | `src/routing.js` | Unit-number extraction + name-hint matching, and `chooseRoutedGroup()` — the pure decision between a **stored** `groups.samsara_vehicle_id` link and a parsed one → target driver group or `fallback-*` reason. |
 | `src/routingFindings.js` | Writes one `operational_findings` row (bot-backend's table, shared database) when routing fell back to the string parse, or when the two answers disagreed — and, on every routed alert, resolves this poller's OTHER routing findings for that vehicle (they are no longer true). Never throws, degrades silently if the table is absent, always tier `warning`, and closes only the three keys it files — this service may report, never correct. |
 | `src/deliveryTracker.js` | Thin ledger wrapper + `classifyTelegramError()` (permanent vs transient). |
@@ -226,5 +227,6 @@ the hub's), `MANAGEMENT_GROUP_ID`, `EMPLOYEE_GROUP_ID`, `HARDCODED_GROUP_ID`,
 | Idempotency ledger (`db.js`, `broadcastDelivery.js`) | Weakening it re-introduces duplicate safety alerts. | Keep the `delivered/permanent` states, the skip-if-settled check, and swallow-permanent behavior. |
 | `pollCoordinator` / bounded sets | Removing them risks OOM (the reason for the split). | Keep sequential polling, heap cap, and queue/set caps. |
 | Shared `groups` table | Schema changes affect **both** repos. | Coordinate any `groups` change with `bot-backend`. |
+| Driver-group switch (`driverGroupSwitch.js`) | Reading it anywhere but the driver-group post would silence the notifications group or the record; guessing it on a read failure either overrides a person's "off" or drops an alert. | Consult it only for the driver group (immediate send + recovery); keep missing column = ON and failure = retry. Every heartbeat (`hubHeartbeat.js`) carries `driverGroupSwitch: true`: the hub's screen says "not applied yet" without it, so do not drop it while the switch is enforced. `tests/driverGroupSwitch.test.js`, `tests/hubHeartbeat.test.js`. |
 | Token separation | Sharing `BOT_TOKEN` breaks polling on both bots. | Keep the Samsara token distinct; keep the exit-78 guard. |
 | `videoUrl.js` allow-list | Loosening it enables SSRF via crafted URLs. | Keep the hostname allow-list. |

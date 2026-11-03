@@ -92,3 +92,16 @@ test('the detail is capped, because it ends up on a public endpoint', async () =
   await hb.beat('error', { detail: 'x'.repeat(5000) });
   assert.equal(pool.calls[0].values[2].length, 300);
 });
+
+test('every beat says this build honours the per-driver switch — the hub screen relies on it', async () => {
+  const pool = recordingPool();
+  const hb = load({ pool });
+  await hb.beat('ok', { summary: { newEvents: 1 } });
+  await hb.beat('blocked', { detail: 'no Samsara API key is configured' });
+  await hb.beat('error', { detail: 'the Samsara safety-events request failed' });
+
+  const summaries = pool.calls.map((c) => JSON.parse(c.values[3]));
+  assert.deepEqual(summaries[0], { newEvents: 1, driverGroupSwitch: true }, 'the counts are kept as they were');
+  assert.deepEqual(summaries[1], { driverGroupSwitch: true });
+  assert.deepEqual(summaries[2], { driverGroupSwitch: true });
+});

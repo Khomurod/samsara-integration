@@ -15,6 +15,10 @@
  * an already-delivered driver group can never be re-sent. This is what fixes
  * the production duplicate bug.
  *
+ * The matched driver group is posted to only while its switch in Wenze is on
+ * (`groups.samsara_driver_alerts_enabled`, see src/driverGroupSwitch.js). That
+ * switch affects the driver group and nothing else.
+ *
  * All external collaborators are injected via `deps` so the whole thing is
  * unit-testable with fakes and no real network.
  */
@@ -100,6 +104,10 @@ async function deliverEvent(alertData, deps) {
     // is handed to sendDriverGroupAlert and applied to the driver group's video
     // copy only. The notifications group / subscribers path never receives it.
     prepareDriverVideo = null,
+    // The per-driver switch set in Wenze (src/driverGroupSwitch.js). Consulted
+    // for the DRIVER GROUP only. Defaults to "on", which is how every alert was
+    // delivered before the switch existed.
+    isDriverGroupAlertsEnabled = async () => true,
     log = console,
   } = deps;
 
@@ -233,8 +241,38 @@ async function deliverEvent(alertData, deps) {
   let driverMembershipAccessError = false;
   let driverSentMessage = null;
 
+  // Has somebody switched this driver group off in Wenze? Asked only when a
+  // post to it is actually about to happen, and asked afresh on every run, so
+  // switching it back on applies from the next alert. Nothing above this line
+  // — the record, the notifications group, the subscribers — depends on it.
+  let driverSwitch = 'on';
+  if (!isFallback && targetDriverGroupId && driverBot && !isSettled(targetDriverGroupId)) {
+    try {
+      const enabled = await isDriverGroupAlertsEnabled({
+        groupId: target.internalGroupId ?? null,
+        telegramGroupId: targetDriverGroupId,
+      });
+      driverSwitch = enabled === false ? 'off' : 'on';
+    } catch (err) {
+      driverSwitch = 'unknown';
+      log.error(`[Bot] Could not read the Samsara switch for driver group ${targetDriverGroupId}: ${err.message}`);
+    }
+  }
+
   if (isFallback) {
     log.warn?.(`[Bot] Unmapped vehicle ${target.vehicleId || 'unknown'} unit ${unitLabel} - no driver group mapped, skipping driver forward`);
+  } else if (driverSwitch === 'off') {
+    // Not delivered and not failed: nothing is written to the ledger, so the
+    // group is simply not a destination of this alert. No driver message means
+    // no video recovery into this group either.
+    driverStatus = 'skip-disabled';
+    log.log?.(`[Bot] Samsara alerts are switched off for driver group ${targetDriverGroupId} (Unit #${unitLabel}) - not posting there`);
+  } else if (driverSwitch === 'unknown') {
+    // Neither post (it may be switched off) nor drop (it may be on): retry the
+    // event like any other transient failure. Targets already delivered are in
+    // the ledger and are not sent again.
+    driverStatus = 'fail-transient';
+    transientPending = true;
   } else if (targetDriverGroupId && driverBot) {
     if (isSettled(targetDriverGroupId)) {
       driverStatus = alreadyDelivered(targetDriverGroupId) ? 'skip-delivered' : 'skip-permanent';

@@ -25,6 +25,7 @@ const { createDeliveryTracker, classifyTelegramError } = require('./src/delivery
 const { getSamsaraSettingsStore } = require('./src/samsaraSettings');
 const { createVideoRecoveryStore } = require('./src/videoRecoveryStore');
 const { createVideoRecoveryWorker, enqueueVideoRecovery } = require('./src/videoRecoveryWorker');
+const { isDriverGroupAlertsEnabled } = require('./src/driverGroupSwitch');
 const { createSafetyEventVideoStore } = require('./src/safetyEventVideoSettings');
 const { createDriverVideoProcessor } = require('./src/safetyEventVideoMusicService');
 const { buildHealthReport } = require('./src/healthReport');
@@ -86,6 +87,8 @@ const videoRecoveryWorker = createVideoRecoveryWorker({
     // The driver group's recovered copy still gets the music overlay; the
     // notifications group never does.
     prepareDriverVideo: driverVideoProcessor.prepareDriverVideoBuffer,
+    // A driver group switched off in Wenze gets no recovered video either.
+    isDriverGroupAlertsEnabled,
     log: console,
 });
 
@@ -291,6 +294,10 @@ async function broadcast(alertData) {
             // to the driver group's video copy; the notifications group is never
             // routed through this.
             prepareDriverVideo: driverVideoProcessor.prepareDriverVideoBuffer,
+            // Wenze → Driver Groups → driver details: whether this alert may also be
+            // posted to the driver's own group. Read from the shared database on
+            // every send; the notifications group and subscribers never consult it.
+            isDriverGroupAlertsEnabled,
             log: console,
         });
     } finally {
