@@ -91,7 +91,7 @@ standby) and in the log:
 | `notificationBot` | the Samsara bot's token works and it can see the Samsara Notifications group |
 | `driverBot` | the main bot's token works |
 | `telegramUpload` | a 256 KB request body was fully sent over the pinned IPv4 path and Telegram answered `200 ok` after it (sent to `getMe`, so nothing is posted). An answer before the body, a 401 or silence fails it |
-| `subscribers` | where the bot's subscriber list lives: `Upstash` (shared — nothing to do) or `local file` (see step 2). Informational; never blocks ready |
+| `subscribers` | where the bot's subscriber list lives: `Upstash` (shared — nothing to do), `Upstash … startup read FAILED` (fix `UPSTASH_*` and redeploy before switching) or `local file` (see step 2). Informational; never blocks ready |
 | `ffmpeg` | the music overlay can run |
 
 **Ready means every line is ✓** (`"ready": true` on `/health`). Leave it in

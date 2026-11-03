@@ -251,5 +251,11 @@ test('default checks: where the subscriber list lives is reported, and never blo
     subscribers: defaultChecks(fakes({ subscribers: { backend: () => 'local-file', count: () => 0 } }).deps).subscribers,
   });
   assert.equal(local.ok, true, 'informational: the runbook says what to do about it');
+
+  const failedRead = await runPreflight({
+    subscribers: defaultChecks(fakes({ subscribers: { backend: () => 'upstash', count: () => 0, loadedFromUpstash: () => false } }).deps).subscribers,
+  });
+  assert.match(failedRead.checks.subscribers.detail, /startup read FAILED — the shared list is not loaded here/);
+  assert.doesNotMatch(failedRead.checks.subscribers.detail, /shared with the old host/);
   assert.match(local.checks.subscribers.detail, /local file, 0 subscriber\(s\) on THIS host — the old host's list does not come across/);
 });

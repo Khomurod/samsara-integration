@@ -241,9 +241,13 @@ function defaultChecks({
       if (!subscribers) return { ok: true, detail: 'not checked' };
       const where = subscribers.backend();
       const n = subscribers.count();
-      return where === 'upstash'
-        ? { ok: true, detail: `Upstash, ${n} subscriber(s) — shared with the old host` }
-        : { ok: true, detail: `local file, ${n} subscriber(s) on THIS host — the old host's list does not come across` };
+      if (where === 'upstash') {
+        const loaded = typeof subscribers.loadedFromUpstash !== 'function' || subscribers.loadedFromUpstash();
+        return loaded
+          ? { ok: true, detail: `Upstash, ${n} subscriber(s) — shared with the old host` }
+          : { ok: true, detail: 'Upstash is configured but the startup read FAILED — the shared list is not loaded here; check UPSTASH_* and redeploy' };
+      }
+      return { ok: true, detail: `local file, ${n} subscriber(s) on THIS host — the old host's list does not come across` };
     },
     ffmpeg: async () => {
       const ok = await ffmpeg.isAvailable();
