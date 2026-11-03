@@ -99,11 +99,20 @@ standby for as long as you like; Render keeps working meanwhile.
 
 ## 2. Switch (a quiet hour, about five minutes)
 
-0. **If the `subscribers` line says `local file`:** either add Upstash
-   (`UPSTASH_REDIS_REST_URL` / `_TOKEN`) to BOTH Render and Coolify first — then
-   the list is shared and survives everything from here on — or accept that a
-   chat which subscribed with `/start` since Render's last restart has to send
-   `/start` once more after the switch. Nothing else depends on that list.
+0. **If the `subscribers` line says `local file`**, Render's list does not
+   come across, and **adding Upstash does not bring it across either**:
+   - A host with Upstash configured loads the Upstash list at startup and
+     replaces its local list with it (`store.init()`), even when the Upstash
+     list is empty.
+   - Adding the variables to Render redeploys it, which empties its local file
+     anyway.
+
+   Either way, a chat that subscribed with `/start` since Render's last
+   restart sends `/start` once more after the switch. Adding Upstash
+   (`UPSTASH_REDIS_REST_URL` / `_TOKEN`) to BOTH hosts first changes only what
+   happens from then on: the chats that subscribe again land in the shared
+   list, and that list survives restarts, this switch and a rollback.
+   Nothing else depends on that list.
 1. **Render → `samsara-poller` → Suspend.** Suspend, do not delete: it is the
    rollback.
 2. **Coolify → the application → Environment → `SAMSARA_STANDBY` = `false`
@@ -128,8 +137,10 @@ standby for as long as you like; Render keeps working meanwhile.
 
 Coolify → **Stop** the application, then Render → **Resume**. The state that
 decides what is sent is in the database, so Render continues where the VPS
-stopped. (A subscriber list kept in a local file is per host: Render resumes
-with its own, as it would after any restart.) Keep Render suspended
+stopped. (Without Upstash the subscriber list is a per-host file, so Render
+resumes with an empty one, as after any restart, and a chat that subscribed
+on the VPS sends `/start` again. With Upstash both hosts read the same list.)
+Keep Render suspended
 for one to two weeks before deleting it.
 
 ## Afterwards
