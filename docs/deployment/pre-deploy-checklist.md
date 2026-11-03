@@ -85,7 +85,7 @@
 | H4 | Rollback is lossless. | **[MANUAL]** stop the new copy, resume the old: all state is in the shared database. |
 
 ## G. Deployment (run in order)
-1. ☐ **[AUTO]** `node --test --test-concurrency=1 tests/*.test.js` → all pass (currently 283).
+1. ☐ **[AUTO]** `node --test --test-concurrency=1 tests/*.test.js` → all pass (currently 285).
 2. ☐ **[AUTO]** Lint/typecheck: *none configured* — N/A.
 3. ☐ **[AUTO]** Build: *no build step* (plain Node) — N/A.
 4. ☐ **[MANUAL]** No schema migration is owned here; the `groups` table is owned by `bot-backend`. If a `groups` change is needed, coordinate with that repo first.

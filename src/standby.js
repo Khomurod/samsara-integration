@@ -11,6 +11,8 @@
  *   - no Telegram polling (getUpdates is never called) and no webhook change;
  *   - no Samsara polling, no deliveries, no video recovery, and no heartbeat to
  *     the hub — the hub keeps hearing only from the copy that is live;
+ *   - no schema setup: the shared database is only read, and a webhook update
+ *     is acknowledged and dropped (index.js);
  *   - instead, a PREFLIGHT: every dependency the live service needs is tried
  *     once, read-only, and the answers are on /health and in the log.
  *
@@ -104,8 +106,14 @@ function buildStandbyHealth({ preflight = null, uptimeSeconds = 0, now = Date.no
 /**
  * Prove a LARGE request body reaches Telegram and an answer comes back — the
  * exact thing an IPv6 black hole breaks — without posting anything: the body
- * goes to getMe, which ignores it. Any HTTP answer means the bytes went through;
- * silence until the timeout means they did not.
+ * goes to getMe, which ignores it.
+ *
+ * Passes only when the whole body was handed to the network AND Telegram
+ * answered `200 {"ok":true}` after it: getMe parses the request before it
+ * answers, so that answer means the bytes arrived. Anything else proves
+ * nothing about the upload path and fails, saying why — an answer that came
+ * before the body finished (a refusal from the headers), a 401 for the token,
+ * or silence until the timeout (the black hole itself).
  */
 function probeTelegramUpload({
   token,
@@ -122,8 +130,10 @@ function probeTelegramUpload({
       resolve({ ok: false, detail: 'no token' });
       return;
     }
+    const kb = Math.round(bytes / 1024);
     const body = Buffer.from(JSON.stringify({ padding: 'x'.repeat(bytes) }));
     const started = now();
+    let bodySent = false;
     let settled = false;
     const finish = (result) => {
       if (settled) return;
@@ -139,15 +149,26 @@ function probeTelegramUpload({
       headers: { 'Content-Type': 'application/json', 'Content-Length': body.length },
       timeout: timeoutMs,
     }, (res) => {
-      res.resume();
-      finish({
-        ok: true,
-        detail: `HTTP ${res.statusCode} for a ${Math.round(bytes / 1024)} KB body in ${now() - started} ms`,
+      const answeredBeforeBody = !bodySent;
+      const chunks = [];
+      res.on('data', (c) => { if (chunks.length < 64) chunks.push(c); });
+      res.on('end', () => {
+        let okJson = false;
+        try { okJson = JSON.parse(Buffer.concat(chunks).toString('utf8')).ok === true; } catch (_) { okJson = false; }
+        if (answeredBeforeBody) {
+          finish({ ok: false, detail: `inconclusive: HTTP ${res.statusCode} came before the ${kb} KB body was sent` });
+        } else if (res.statusCode === 200 && okJson) {
+          finish({ ok: true, detail: `a ${kb} KB body reached Telegram, answered 200 ok in ${now() - started} ms` });
+        } else {
+          finish({ ok: false, detail: `inconclusive: HTTP ${res.statusCode}${res.statusCode === 401 ? ' (token rejected)' : ''} after the ${kb} KB body` });
+        }
       });
+      res.on('error', (err) => finish({ ok: false, detail: scrub(err.code || err.message, [token]) }));
     });
+    req.on('finish', () => { bodySent = true; });
     req.on('timeout', () => {
       req.destroy();
-      finish({ ok: false, detail: `no answer within ${Math.round(timeoutMs / 1000)}s for a ${Math.round(bytes / 1024)} KB body — uploads would stall` });
+      finish({ ok: false, detail: `no answer within ${Math.round(timeoutMs / 1000)}s for a ${kb} KB body — uploads would stall` });
     });
     req.on('error', (err) => finish({ ok: false, detail: scrub(err.code || err.message, [token]) }));
     req.end(body);
@@ -167,6 +188,7 @@ function defaultChecks({
   forcedGroupId,
   ffmpeg,
   agent,
+  subscribers = null,
   fetchImpl = fetch,
 }) {
   return {
@@ -213,6 +235,16 @@ function defaultChecks({
       return { ok: true, detail: `@${me.username}` };
     },
     telegramUpload: () => probeTelegramUpload({ token: notificationToken, agent }),
+    // Informational: never blocks "ready". A local file is this host's own and
+    // starts empty here — docs/deployment/coolify.md says what to do about it.
+    subscribers: async () => {
+      if (!subscribers) return { ok: true, detail: 'not checked' };
+      const where = subscribers.backend();
+      const n = subscribers.count();
+      return where === 'upstash'
+        ? { ok: true, detail: `Upstash, ${n} subscriber(s) — shared with the old host` }
+        : { ok: true, detail: `local file, ${n} subscriber(s) on THIS host — the old host's list does not come across` };
+    },
     ffmpeg: async () => {
       const ok = await ffmpeg.isAvailable();
       return ok

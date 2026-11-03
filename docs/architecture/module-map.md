@@ -118,7 +118,7 @@ SIGINT/SIGTERM.
 | File | Responsibility |
 |---|---|
 | `src/telegramNetwork.js` | Every Telegram call over IPv4 (one keep-alive agent handed to both bots; node-telegram-bot-api passes it into API calls, multipart uploads and file downloads), and IPv4-first DNS for everything else. The Hostinger VPS black-holes large request bodies over IPv6 — sendVideo would stall. Harmless on Render. |
-| `src/standby.js` | `SAMSARA_STANDBY=true`: up and silent — no Telegram or Samsara polling, no posts, no video recovery, no heartbeat — plus a read-only preflight (database, migration 0090, Samsara key and API, both bots, a 256 KB upload probe to `getMe`, ffmpeg) reported on `/health` (always 200 in standby). How the service moves host without two copies ever running at once: `docs/deployment/coolify.md`. |
+| `src/standby.js` | `SAMSARA_STANDBY=true`: up and silent — no Telegram or Samsara polling, no posts, no video recovery, no heartbeat, no schema setup, webhook updates dropped — plus a read-only preflight (database, migration 0090, Samsara key and API, both bots, a 256 KB upload probe to `getMe` that passes only on 200 ok after the whole body, the subscriber list's storage, ffmpeg) reported on `/health` (always 200 in standby). How the service moves host without two copies ever running at once: `docs/deployment/coolify.md`. |
 
 ## Idempotency — three layers (do not weaken)
 

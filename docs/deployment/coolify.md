@@ -13,10 +13,17 @@ the VPS, everything it needs.
 
 ## Why the move cannot lose or duplicate anything
 
-- **All state is in the shared database.** The poll watermark
-  (`samsara_poll_state`), the processed events (`samsara_processed_events`),
-  the per-target delivery ledger, the video-recovery queue and the
-  safety-event record. Nothing lives on the Render instance.
+- **The state that decides what is sent is in the shared database.** The poll
+  watermark (`samsara_poll_state`), the processed events
+  (`samsara_processed_events`), the per-target delivery ledger, the
+  video-recovery queue and the safety-event record.
+- **One thing may not be:** the Samsara bot's subscriber list (chats that sent
+  it `/start`). With `UPSTASH_REDIS_REST_URL` / `_TOKEN` set it is in Upstash
+  and both hosts share it. Without them it is a file on the Render instance,
+  which Render already empties on every restart and sleep — and which does not
+  come across. The "Samsara Notifications" group is not on that list; it is
+  always sent to. The preflight's `subscribers` line says which case applies
+  (see step 2).
 - **A new copy re-reads the last two hours** from the stored watermark and
   skips every event already processed. Events that arrive during the switch
   are picked up by the first poll — a few minutes late, never lost, never
@@ -69,7 +76,9 @@ Deploy.
 ### What standby does
 
 Nothing anyone can see (`src/standby.js`): no Telegram polling, no Samsara
-polling, no posts, no video recovery, no heartbeat to the hub. It runs a
+polling, no posts, no video recovery, no heartbeat to the hub, no schema setup
+(the shared database is only read), and a webhook update, should one arrive,
+is acknowledged and dropped. It runs a
 **preflight** once, read-only, and reports it on `/health` (always HTTP 200 in
 standby) and in the log:
 
@@ -81,7 +90,8 @@ standby) and in the log:
 | `samsaraApi` | Samsara answers with that key (one vehicle is read) |
 | `notificationBot` | the Samsara bot's token works and it can see the Samsara Notifications group |
 | `driverBot` | the main bot's token works |
-| `telegramUpload` | a 256 KB request body reaches Telegram and an answer comes back over the pinned IPv4 path (sent to `getMe`, so nothing is posted) |
+| `telegramUpload` | a 256 KB request body was fully sent over the pinned IPv4 path and Telegram answered `200 ok` after it (sent to `getMe`, so nothing is posted). An answer before the body, a 401 or silence fails it |
+| `subscribers` | where the bot's subscriber list lives: `Upstash` (shared — nothing to do) or `local file` (see step 2). Informational; never blocks ready |
 | `ffmpeg` | the music overlay can run |
 
 **Ready means every line is ✓** (`"ready": true` on `/health`). Leave it in
@@ -89,6 +99,11 @@ standby for as long as you like; Render keeps working meanwhile.
 
 ## 2. Switch (a quiet hour, about five minutes)
 
+0. **If the `subscribers` line says `local file`:** either add Upstash
+   (`UPSTASH_REDIS_REST_URL` / `_TOKEN`) to BOTH Render and Coolify first — then
+   the list is shared and survives everything from here on — or accept that a
+   chat which subscribed with `/start` since Render's last restart has to send
+   `/start` once more after the switch. Nothing else depends on that list.
 1. **Render → `samsara-poller` → Suspend.** Suspend, do not delete: it is the
    rollback.
 2. **Coolify → the application → Environment → `SAMSARA_STANDBY` = `false`
@@ -111,8 +126,10 @@ standby for as long as you like; Render keeps working meanwhile.
 
 ## Rollback (two minutes, nothing lost)
 
-Coolify → **Stop** the application, then Render → **Resume**. State is in the
-database, so Render continues where the VPS stopped. Keep Render suspended
+Coolify → **Stop** the application, then Render → **Resume**. The state that
+decides what is sent is in the database, so Render continues where the VPS
+stopped. (A subscriber list kept in a local file is per host: Render resumes
+with its own, as it would after any restart.) Keep Render suspended
 for one to two weeks before deleting it.
 
 ## Afterwards

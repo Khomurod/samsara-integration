@@ -354,7 +354,10 @@ if (USE_WEBHOOK) {
     bot = new TelegramBot(TOKEN, telegramBotOptions({ polling: false }));
     const telegramWebhookPath = `/telegram-webhook/${TOKEN}`;
     app.post(telegramWebhookPath, (req, res) => {
-        bot.processUpdate(req.body);
+        // In standby an update is acknowledged and dropped: /start and /stop
+        // would change subscriptions and reply, and standby posts nothing.
+        // (Skipping setWebHook below does not undo a webhook already aimed here.)
+        if (!STANDBY) bot.processUpdate(req.body);
         res.sendStatus(200);
     });
 } else {
@@ -425,14 +428,20 @@ bot.onText(/\/help/, (msg) => {
 // ?? Start Server ??????????????????????????????????????????????????????????????
 async function start() {
     await store.init();
-    await samsaraDb.initPgDb();
-    await videoRecoveryStore.ensureSchema();
-    // ANSWERED BEFORE AN INCIDENT, NOT AFTER. This is the same idempotent
-    // statement the first safety event would have run; running it here is what
-    // lets /health say whether this service can record at all, rather than
-    // whether a driver has done something wrong since the last restart. It
-    // catches its own failures and returns false, so it can never fail boot.
-    await require('./src/safetyEventStore').ensureTable();
+    // Schema setup only for the copy that is live. In standby the tables
+    // already exist (the live copy made them) and the shared database is only
+    // read: initPgDb also drops and re-adds a constraint, which takes a lock on
+    // a table the live copy is writing to.
+    if (!STANDBY) {
+        await samsaraDb.initPgDb();
+        await videoRecoveryStore.ensureSchema();
+        // ANSWERED BEFORE AN INCIDENT, NOT AFTER. This is the same idempotent
+        // statement the first safety event would have run; running it here is what
+        // lets /health say whether this service can record at all, rather than
+        // whether a driver has done something wrong since the last restart. It
+        // catches its own failures and returns false, so it can never fail boot.
+        await require('./src/safetyEventStore').ensureTable();
+    }
     await new Promise((resolve) => {
         httpServer = app.listen(PORT, resolve);
     });
@@ -494,10 +503,8 @@ async function start() {
     await logVideoRecoveryReadiness();
 
     if (STANDBY) {
-        // Everything above only read, or ensured tables that already exist (the
-        // same idempotent statements every boot runs). Prove the rest, then
-        // stay idle: no video recovery, no polling, no heartbeat — the live
-        // copy owns all of them.
+        // Everything above only read. Prove the rest, then stay idle: no video
+        // recovery, no polling, no heartbeat — the live copy owns all of them.
         standbyPreflight = await standby.runPreflight(standby.defaultChecks({
             pool: samsaraDb.getPgPool(),
             settingsStore: samsaraSettings,
@@ -507,6 +514,7 @@ async function start() {
             forcedGroupId: process.env.HARDCODED_GROUP_ID || '-5192934125',
             ffmpeg: driverVideoProcessor.ffmpeg,
             agent: telegramIpv4Agent,
+            subscribers: store,
         }), { secrets: [TOKEN, MAIN_BOT_TOKEN] });
         standby.logPreflight(standbyPreflight);
         console.log('[Standby] Idle. To go live: stop the old host, set SAMSARA_STANDBY=false, restart.');

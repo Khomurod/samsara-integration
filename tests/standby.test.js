@@ -8,8 +8,9 @@
  *   · the preflight never throws: a check that throws or hangs is a failed
  *     check and the others still run;
  *   · no token ever reaches a log line or /health;
- *   · the upload probe passes when a large body gets ANY answer, and fails
- *     when the answer never comes — the IPv6 black hole it exists to catch;
+ *   · the upload probe passes only when the whole body went out and Telegram
+ *     answered 200 ok after it; an early answer, a refusal or a 401 proves
+ *     nothing and fails, and silence is the IPv6 black hole it exists to catch;
  *   · the default checks only read, and say plainly what is missing.
  */
 'use strict';
@@ -17,6 +18,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const { EventEmitter } = require('node:events');
 
 const {
   isStandby, scrub, runPreflight, buildStandbyHealth, probeTelegramUpload, defaultChecks, logPreflight,
@@ -91,7 +93,7 @@ function server(handler) {
   });
 }
 
-test('upload probe: a large body that gets an answer passes, and nothing is posted', async () => {
+test('upload probe: a large body that reaches Telegram and gets 200 ok passes, and nothing is posted', async () => {
   const seen = [];
   const s = await server((req, res) => {
     let size = 0;
@@ -105,7 +107,7 @@ test('upload probe: a large body that gets an answer passes, and nothing is post
   try {
     const out = await probeTelegramUpload({ token: TOKEN, transport: http, hostname: '127.0.0.1', port: s.address().port, bytes: 64 * 1024 });
     assert.equal(out.ok, true);
-    assert.match(out.detail, /HTTP 200 for a 64 KB body/);
+    assert.match(out.detail, /a 64 KB body reached Telegram, answered 200 ok/);
     assert.equal(seen.length, 1);
     assert.equal(seen[0].method, 'POST');
     assert.equal(seen[0].path, `/bot${TOKEN}/getMe`, 'getMe only — never a send method');
@@ -114,13 +116,45 @@ test('upload probe: a large body that gets an answer passes, and nothing is post
   } finally { s.close(); }
 });
 
-test('upload probe: any HTTP answer proves the bytes went through', async () => {
-  const s = await server((req, res) => { req.resume(); req.on('end', () => { res.writeHead(413); res.end(); }); });
-  try {
-    const out = await probeTelegramUpload({ token: TOKEN, transport: http, hostname: '127.0.0.1', port: s.address().port, bytes: 1024 });
-    assert.equal(out.ok, true);
-    assert.match(out.detail, /HTTP 413/);
-  } finally { s.close(); }
+test('upload probe: a refusal after the body proves nothing, and says so', async () => {
+  for (const [status, body, expect] of [
+    [413, '', /inconclusive: HTTP 413 after the 1 KB body/],
+    [401, '{"ok":false,"error_code":401}', /HTTP 401 \(token rejected\)/],
+    [200, '{"ok":false}', /inconclusive: HTTP 200/],
+    [200, 'not json', /inconclusive: HTTP 200/],
+  ]) {
+    // eslint-disable-next-line no-await-in-loop
+    const s = await server((req, res) => { req.resume(); req.on('end', () => { res.writeHead(status); res.end(body); }); });
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const out = await probeTelegramUpload({ token: TOKEN, transport: http, hostname: '127.0.0.1', port: s.address().port, bytes: 1024 });
+      assert.equal(out.ok, false, `${status} ${body}`);
+      assert.match(out.detail, expect);
+    } finally { s.close(); }
+  }
+});
+
+test('upload probe: an answer that comes before the body is sent is inconclusive, even 200 ok', async () => {
+  // A transport where the answer arrives first and the body finishes after —
+  // what a server or intermediary rejecting from the headers looks like.
+  const transport = {
+    request(opts, onResponse) {
+      const req = new EventEmitter();
+      req.end = () => {
+        const res = new EventEmitter();
+        res.statusCode = 200;
+        onResponse(res);
+        res.emit('data', Buffer.from('{"ok":true}'));
+        res.emit('end');
+        req.emit('finish');
+      };
+      req.destroy = () => {};
+      return req;
+    },
+  };
+  const out = await probeTelegramUpload({ token: TOKEN, transport, bytes: 1024 });
+  assert.equal(out.ok, false);
+  assert.match(out.detail, /came before the 1 KB body was sent/);
 });
 
 test('upload probe: no answer is a failure that says uploads would stall', async () => {
@@ -162,6 +196,7 @@ function fakes(over = {}) {
       notificationToken: TOKEN,
       forcedGroupId: '-500',
       ffmpeg: { async isAvailable() { return true; } },
+      subscribers: { backend: () => 'upstash', count: () => 3 },
       fetchImpl: async (url, opts) => { queries.push(`FETCH ${url} ${opts.headers.Authorization ? 'auth' : ''}`); return { ok: true, status: 200 }; },
       ...over,
     },
@@ -205,4 +240,16 @@ test('default checks: a hub without migration 0090 is reported, not hidden', asy
   const out = await runPreflight({ driverGroupSwitch: defaultChecks(f.deps).driverGroupSwitch });
   assert.equal(out.ok, false);
   assert.match(out.checks.driverGroupSwitch.detail, /migration 0090/);
+});
+
+test('default checks: where the subscriber list lives is reported, and never blocks ready', async () => {
+  const shared = await runPreflight({ subscribers: defaultChecks(fakes().deps).subscribers });
+  assert.equal(shared.ok, true);
+  assert.match(shared.checks.subscribers.detail, /Upstash, 3 subscriber\(s\) — shared with the old host/);
+
+  const local = await runPreflight({
+    subscribers: defaultChecks(fakes({ subscribers: { backend: () => 'local-file', count: () => 0 } }).deps).subscribers,
+  });
+  assert.equal(local.ok, true, 'informational: the runbook says what to do about it');
+  assert.match(local.checks.subscribers.detail, /local file, 0 subscriber\(s\) on THIS host — the old host's list does not come across/);
 });

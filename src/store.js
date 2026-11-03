@@ -155,6 +155,14 @@ module.exports = {
   },
 
   /**
+   * Where the list lives: 'upstash' (shared, survives anything) or
+   * 'local-file' (this host's data/subscribers.json only).
+   */
+  backend() {
+    return USE_REDIS ? 'upstash' : 'local-file';
+  },
+
+  /**
    * Load all subscribers from Redis into cache on startup.
    * Ensures all IDs are stored as strings for consistent lookups.
    */
