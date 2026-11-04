@@ -21,7 +21,7 @@ const { execFileSync } = require('child_process');
 
 const FETCH_TIMEOUT_MS = 40_000;
 
-const state = { status: 'not-run', reason: null, version: null, digest: null, names: [], pinned: false };
+const state = { status: 'not-run', reason: null, retryable: false, version: null, digest: null, names: [], pinned: false };
 
 function isOn(value) {
   return /^(1|true|yes|on)$/i.test(String(value || '').trim());
@@ -57,7 +57,10 @@ function loadAppSecrets({ env = process.env, fetch = runFetch, log = console } =
   if (!result || result.status !== 'loaded') {
     const status = result && result.status === 'skipped' ? 'skipped' : 'failed';
     const reason = (result && result.reason) || 'no answer';
-    Object.assign(state, { status, reason, version: null, digest: null, names: [], pinned });
+    // A database that could not be reached may answer later; stored values that
+    // could not be opened will not open on the next start either.
+    const retryable = status === 'failed' && /^(database read failed|the read timed out|the read could not run|no answer|unexpected error)/.test(reason);
+    Object.assign(state, { status, reason, retryable, version: null, digest: null, names: [], pinned });
     (status === 'skipped' ? log.log : log.error).call(log, `[Secrets] Not loaded from the app (${reason}) — using the Coolify environment.`);
     return state;
   }
@@ -65,7 +68,7 @@ function loadAppSecrets({ env = process.env, fetch = runFetch, log = console } =
   const names = Object.keys(result.values).sort();
   const overridden = names.filter((name) => env[name] !== undefined && env[name] !== result.values[name]);
   for (const name of names) env[name] = result.values[name];
-  Object.assign(state, { status: 'loaded', reason: null, version: result.version, digest: result.digest || null, names, pinned });
+  Object.assign(state, { status: 'loaded', reason: null, retryable: false, version: result.version, digest: result.digest || null, names, pinned });
   log.log(
     `[Secrets] Loaded ${names.length} setting(s) from the app (version ${result.version}${pinned ? ', pinned by APP_SECRETS_VERSION' : ''})`
     + `${overridden.length ? `; overriding Coolify for ${overridden.join(', ')}` : ''}.`,

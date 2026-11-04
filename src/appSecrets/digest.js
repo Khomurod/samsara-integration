@@ -21,14 +21,4 @@ function digestRows(rows) {
   return crypto.createHash('sha256').update(lines.join('\n')).digest('hex');
 }
 
-/** The TLS setting for a connection string — the hub's rule (lib/database/sslForUrl.js there). */
-function sslForUrl(url) {
-  const text = String(url || '');
-  if (!text) return false;
-  if (text.includes('sslmode=require') || text.includes('supabase') || text.includes('neon')) {
-    return { rejectUnauthorized: false };
-  }
-  return false;
-}
-
-module.exports = { SCOPES, digestRows, sslForUrl };
+module.exports = { SCOPES, digestRows };

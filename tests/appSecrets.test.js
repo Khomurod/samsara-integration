@@ -193,3 +193,37 @@ test('a database hiccup is logged once by code and does not restart', async () =
   assert.ok(!lines[0].includes('secret@host'));
   assert.equal(restarts, 0);
 });
+
+test('a version whose values cannot be read this minute is asked about again, not skipped', async () => {
+  let fail = true;
+  const query = async (sql, params) => {
+    if (sql.includes('app_secret_versions')) return { rows: [{ id: 9, key_fingerprint: FP }] };
+    if (fail) throw Object.assign(new Error('reset'), { code: 'ECONNRESET' });
+    return { rows: [{ scope: 'samsara', name: 'SAMSARA_BOT_TOKEN', ciphertext: 'new' }].filter((r) => params[1].includes(r.scope)) };
+  };
+  let restarts = 0;
+  const w = createSecretsWatch({ query, env: ENV, boot: { status: 'loaded', version: 4, digest: digestRows(ours) }, restart: () => { restarts += 1; }, log: recorder().log });
+  assert.equal((await w.check()).action, 'error');
+  fail = false;
+  assert.deepEqual(await w.check(), { action: 'restart', version: 9 });
+  assert.equal(restarts, 1);
+});
+
+test('a start that could not open the stored values does not watch (no restart loop); one that could not reach the database does', async () => {
+  const d = db({ latest: () => ({ id: 2, key_fingerprint: FP }), rows: ours });
+  let restarts = 0;
+  const stuck = createSecretsWatch({ query: d.query, env: ENV, boot: { status: 'failed', retryable: false }, restart: () => { restarts += 1; }, log: recorder().log });
+  assert.equal(stuck.start(), false);
+  assert.deepEqual(await stuck.check(), { action: 'none' });
+  const later = createSecretsWatch({ query: d.query, env: ENV, boot: { status: 'failed', retryable: true }, restart: () => { restarts += 1; }, log: recorder().log });
+  assert.equal((await later.check()).action, 'restart');
+  later.stop();
+  assert.equal(restarts, 1);
+});
+
+test('boot marks a database failure as retryable and an unreadable value as not', () => {
+  const a = loadAppSecrets({ env: {}, fetch: () => ({ status: 'failed', reason: 'database read failed (ECONNREFUSED)' }), log: recorder().log });
+  assert.equal(a.retryable, true);
+  const b = loadAppSecrets({ env: {}, fetch: () => ({ status: 'failed', reason: 'could not open X in version 3' }), log: recorder().log });
+  assert.equal(b.retryable, false);
+});

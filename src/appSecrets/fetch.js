@@ -23,7 +23,7 @@
  */
 const { Client } = require('pg');
 const sharedCrypto = require('../sharedIntegrationCrypto');
-const { SCOPES, digestRows, sslForUrl } = require('./digest');
+const { SCOPES, digestRows } = require('./digest');
 
 const CONNECT_TIMEOUT_MS = 15_000;
 const QUERY_TIMEOUT_MS = 10_000;
@@ -42,7 +42,8 @@ async function fetchAppSecrets(env = process.env, ClientImpl = Client) {
 
   const client = new ClientImpl({
     connectionString: url,
-    ssl: sslForUrl(url),
+    // The same TLS setting as this service's pool (src/db.js): always on.
+    ssl: { rejectUnauthorized: false },
     connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
     query_timeout: QUERY_TIMEOUT_MS,
   });

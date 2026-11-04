@@ -41,6 +41,11 @@ function createSecretsWatch({
   const key = String(env.INTEGRATION_SECRET_KEY || '').trim();
   const reasonOff = (boot.status === 'off' && 'APP_SECRETS_OFF is set')
     || (boot.pinned && 'APP_SECRETS_VERSION is set')
+    // Stored values that could not be opened at start would fail again after a
+    // restart: watching would only restart it in a loop. (A database that could
+    // not be reached is different — the first version read later restarts it
+    // once, and that start succeeds.)
+    || (boot.status === 'failed' && !boot.retryable && 'the stored settings could not be opened at start')
     || (!key && 'INTEGRATION_SECRET_KEY is not set')
     || (!String(env.DATABASE_URL || '').trim() && 'DATABASE_URL is not set')
     || null;
@@ -66,15 +71,25 @@ function createSecretsWatch({
     lastError = null;
     if (!latest || Number(latest.id) === lastSeen) return { action: 'none' };
     const id = Number(latest.id);
-    lastSeen = id;
     if (latest.key_fingerprint !== ourFingerprint) {
+      lastSeen = id;
       log.warn(`[Secrets] Version ${id} was stored under a different INTEGRATION_SECRET_KEY — ignored.`);
       return { action: 'ignored', version: id };
     }
-    const rows = (await query(
-      'SELECT scope, name, ciphertext FROM app_secret_values WHERE version_id = $1 AND scope = ANY($2::text[])',
-      [id, SCOPES],
-    )).rows;
+    let rows;
+    try {
+      rows = (await query(
+        'SELECT scope, name, ciphertext FROM app_secret_values WHERE version_id = $1 AND scope = ANY($2::text[])',
+        [id, SCOPES],
+      )).rows;
+    } catch (err) {
+      // Not marked seen: the next minute asks again rather than missing the change.
+      const code = (err && err.code) || 'error';
+      if (code !== lastError) log.warn(`[Secrets] Could not read version ${id} (${code}).`);
+      lastError = code;
+      return { action: 'error', version: id };
+    }
+    lastSeen = id;
     if (digestRows(rows) === baseline) return { action: 'unchanged', version: id };
     restarting = true;
     log.log(`[Secrets] Version ${id} changed this service's settings — restarting to load them.`);
