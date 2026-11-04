@@ -6,7 +6,10 @@
  * Keep secrets out of source files and store them in your secret manager.
  */
 
-require('dotenv').config();
+// The app secrets (stored in the hub's Settings → Secrets) go into process.env
+// FIRST: everything below reads its settings from there (src/appSecrets/boot.js).
+const appSecretsBoot = require('./src/appSecrets/boot');
+appSecretsBoot.bootAppSecrets();
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 
@@ -38,6 +41,8 @@ const { getSamsaraSettingsStore } = require('./src/samsaraSettings');
 const { createVideoRecoveryStore } = require('./src/videoRecoveryStore');
 const { createVideoRecoveryWorker, enqueueVideoRecovery } = require('./src/videoRecoveryWorker');
 const { isDriverGroupAlertsEnabled } = require('./src/driverGroupSwitch');
+const { createSecretsWatch } = require('./src/appSecrets/watch');
+let secretsWatch = null;
 const { createSafetyEventVideoStore } = require('./src/safetyEventVideoSettings');
 const { createDriverVideoProcessor } = require('./src/safetyEventVideoMusicService');
 const { buildHealthReport } = require('./src/healthReport');
@@ -525,6 +530,14 @@ async function start() {
 
     // Start coordinated polling
     coordinator.start();
+
+    // A save in the hub's Settings → Secrets that changes THIS service's values
+    // restarts it (src/appSecrets/watch.js). Not in standby: nothing runs there.
+    secretsWatch = createSecretsWatch({
+        query: (text, values) => samsaraDb.getPgPool().query(text, values),
+        boot: appSecretsBoot.getBootState(),
+    });
+    secretsWatch.start();
 }
 
 /**
@@ -620,6 +633,7 @@ async function shutdown(signal) {
     console.log(`\n[App] Shutting down (${signal})...`);
     coordinator.stop();
     videoRecoveryWorker.stop();
+    if (secretsWatch) secretsWatch.stop();
     if (!USE_WEBHOOK) {
         try {
             await bot.stopPolling();

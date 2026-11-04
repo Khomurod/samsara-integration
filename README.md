@@ -288,6 +288,20 @@ Samsara API — just provide a valid API key with at minimum **Read** access to
 
 ## Environment Variables
 
+**Since November 2026 these values are stored in the hub's database**, encrypted,
+and managed in the hub's **Settings → System → Secrets** (upload this service's
+`.env` there with "Samsara service" chosen; bot-backend
+`docs/architecture/app-secrets.md`). Coolify keeps only `DATABASE_URL` and
+`INTEGRATION_SECRET_KEY` — the same `INTEGRATION_SECRET_KEY` the hub has.
+`src/appSecrets/boot.js` puts the stored values into `process.env` before
+anything reads them (a stored value overrides Coolify's), and
+`src/appSecrets/watch.js` restarts the service within about a minute when a save
+changes one of ITS values. `BOT_TOKEN`, `SAMSARA_API_KEY`, `GEMINI_*`, `GROQ_*`
+and the shared group ids are stored once for both services. To get back when a
+version breaks the start: `APP_SECRETS_VERSION=<n>` (load an older version) or
+`APP_SECRETS_OFF=true` (use only Coolify) in Coolify. The table below is what
+the values mean, wherever they are kept.
+
 | Variable                    | Required | Description                                                        |
 |-----------------------------|----------|--------------------------------------------------------------------|
 | `TELEGRAM_BOT_TOKEN`        | ✅       | Telegram bot token from BotFather                                   |

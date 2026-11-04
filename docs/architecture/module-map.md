@@ -98,6 +98,8 @@ SIGINT/SIGTERM.
 |---|---|
 | `src/samsaraSettings.js` | Reads `samsara_settings` (written by the admin panel) over the shared database, with the environment as a per-value fallback. One shared store for the whole process, reading only the columns it uses and caching the row for **5 minutes** (a failed read is retried after 30 s) — so a change saved in the panel lands within five minutes. |
 | `src/sharedIntegrationCrypto.js` | The AES-256-GCM envelope this service and `bot-backend` both open, keyed from a secret both already hold. Mirrored file — keep the two identical. |
+| `src/appSecrets/boot.js`, `fetch.js` | The deployment's settings, stored in the hub's Settings → Secrets: read at boot (index.js's first statement, a short child process) with `INTEGRATION_SECRET_KEY` only, scopes `both` then `samsara`, over Coolify's values; any failure leaves Coolify's environment untouched. The twin of the hub's `config/appSecretsBoot.js` / `appSecretsFetch.js` — bot-backend `docs/architecture/app-secrets.md`. |
+| `src/appSecrets/watch.js`, `digest.js` | Once a minute, the newest version's id (one tiny row); when it moved, a digest of THIS service's rows — and a graceful restart only when one of its own values changed. Off while `APP_SECRETS_OFF` / `APP_SECRETS_VERSION` is set or without `INTEGRATION_SECRET_KEY`. |
 
 ### AI
 | File | Responsibility |
@@ -212,7 +214,7 @@ The **"Samsara Notifications" group** is a fixed chat (`HARDCODED_GROUP_ID`) and
 is always included so every event lands there regardless of routing.
 `verifyNotificationBotAccess()` self-checks membership at startup.
 
-## Tests (`npm test` → `node --test --test-concurrency=1 tests/*.test.js`, 176 tests)
+## Tests (`npm test` → `node --test --test-concurrency=1 tests/*.test.js`, 296 tests)
 `samsaraIdempotentDelivery` · `samsaraBroadcastDelivery` · `samsaraRouting` ·
 `samsaraStoredVehicleRouting` ·
 `samsaraDriverAlertMessageAi` · `samsaraVideoBackfill` · `samsaraVideoRetryDelivery` ·
