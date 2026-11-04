@@ -143,6 +143,17 @@ on the VPS sends `/start` again. With Upstash both hosts read the same list.)
 Keep Render suspended
 for one to two weeks before deleting it.
 
+## Settings in the app (November 2026)
+
+After the move the plan takes this service's settings out of Coolify too: they
+are uploaded in the hub's **Settings → System → Secrets** (choose "Samsara
+service"), and Coolify keeps only `DATABASE_URL` and `INTEGRATION_SECRET_KEY`
+(the hub's value). The service reads them at boot (`src/appSecrets/boot.js`)
+and restarts itself within a minute when a save changes one of its values
+(`src/appSecrets/watch.js`). If a stored version ever keeps it from starting,
+set `APP_SECRETS_VERSION=<an earlier number>` or `APP_SECRETS_OFF=true` here and
+redeploy. The rules: bot-backend `docs/architecture/app-secrets.md`.
+
 ## Afterwards
 
 - Delete the Render service, and any uptime pinger aimed at its URL.
