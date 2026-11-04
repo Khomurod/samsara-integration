@@ -227,3 +227,14 @@ test('boot marks a database failure as retryable and an unreadable value as not'
   const b = loadAppSecrets({ env: {}, fetch: () => ({ status: 'failed', reason: 'could not open X in version 3' }), log: recorder().log });
   assert.equal(b.retryable, false);
 });
+
+test('a value read that keeps failing the same way is logged once, not every minute', async () => {
+  const { lines, log } = recorder();
+  const query = async (sql) => {
+    if (sql.includes('app_secret_versions')) return { rows: [{ id: 9, key_fingerprint: FP }] };
+    throw Object.assign(new Error('x'), { code: 'ECONNRESET' });
+  };
+  const w = createSecretsWatch({ query, env: ENV, boot: { status: 'loaded', version: 4, digest: 'd' }, restart: () => {}, log });
+  for (let i = 0; i < 3; i += 1) assert.equal((await w.check()).action, 'error');
+  assert.equal(lines.length, 1);
+});

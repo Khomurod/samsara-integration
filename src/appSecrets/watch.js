@@ -68,8 +68,10 @@ function createSecretsWatch({
       lastError = code;
       return { action: 'error' };
     }
-    lastError = null;
-    if (!latest || Number(latest.id) === lastSeen) return { action: 'none' };
+    if (!latest || Number(latest.id) === lastSeen) {
+      lastError = null;
+      return { action: 'none' };
+    }
     const id = Number(latest.id);
     if (latest.key_fingerprint !== ourFingerprint) {
       lastSeen = id;
@@ -89,6 +91,7 @@ function createSecretsWatch({
       lastError = code;
       return { action: 'error', version: id };
     }
+    lastError = null;
     lastSeen = id;
     if (digestRows(rows) === baseline) return { action: 'unchanged', version: id };
     restarting = true;
